@@ -18,7 +18,7 @@ ringlog 是「一个库 + 一个命令行应用」：**库是引擎，二进制�
 ┌───────────────────────────▼──────────────────────────────────┐
 │ lib：ringlog（引擎，无终端 I/O、无 clap、无中文文案）          │
 │  format.rs 文件布局、Header 编解码、尺寸约束                  │
-│  input.rs  字节流 → Batch（payload + Record）                 │
+│  input.rs  字节流 → 以换行结尾、长度受限的 payload            │
 │  ring.rs   Ring（写者）/ Reader（读者）/ 头读写 / 锁文件      │
 │  seek.rs   窗口定位：StartPos / locate_start / scan_*         │
 │  error.rs  错误分类：usage / invalid / is_user_error          │
@@ -76,7 +76,7 @@ rg -n 'io::stdout|io::stderr' src/
 | --- | --- | --- |
 | `format` | 布局常量、`Header` 双 slot 编解码、不变量校验、尺寸推导 | `Header`、`MIN_TOTAL_SIZE`、`data_capacity`、`file_size` |
 | `ring` | 写者互斥与环形写（含换行填充）、读者共享锁快照、跨环读 | `Ring::open/append`、`Reader::open/with_snapshot/read_exact_abs`、`lock_path` |
-| `input` | 按 `\n` 分帧，超长行截断并计数 | `LineSplitter::feed/take(final_chunk)`、`Batch`、`Record` |
+| `input` | 按 `\n` 分帧，超长行截断并计数，输出完整记录串 | `LineSplitter::feed/take(final_chunk)`、`payload_len` |
 | `seek` | 在环形窗口里找记录起点，报告丢弃量 | `StartPos`、`Located`（`pos/dropped/no_newline`）、`locate_start`、`scan_to_next_line` |
 | `error` | 区分用法/数据错误与普通 I/O 错误 | `usage`、`invalid`（crate 内）、`is_user_error`（公开） |
 | `app::cli` | clap 参数、模式互斥、尺寸解析 | `parse` → `Cli { path, mode: Mode }` |
@@ -92,9 +92,10 @@ rg -n 'io::stdout|io::stderr' src/
 ```
 stdin ──读线程（256 KiB 块，sync_channel(4)）──▶ LineSplitter.feed
       ▶ 超长行截断计数
-      ▶ 攒满 256 KiB / 4096 条，或 100 ms 兜底 ──▶ Ring::append(Batch)
-          [flock 排他] 规划 Op（Pad / Data）→ write_all_at →（--sync 时 fsync）
-                     → 写新 header slot → 更新内存状态 → 解锁
+      ▶ 攒满 256 KiB，或 20 ms 兜底（--sync 为 100 ms）──▶ Ring::append(payload)
+          [flock 排他] 整批不跨窗口时一次 write_all_at（快路径）
+                     跨窗口时才按换行切分、填充、绕回（慢路径）
+                     →（--sync 时 fsync）→ 写新 header slot → 更新内存状态 → 解锁
 ```
 
 **读取**：
@@ -113,7 +114,7 @@ Reader::open（校验 文件大小 == file_size(capacity)）
 | 契约 | 定义方 | 维护方 | 依赖方 |
 | --- | --- | --- | --- |
 | 布局与不变量 `total_written % capacity == write_pos` | `format` | `ring` 写批次时保证 | `seek`、`follow` 计算逻辑偏移 |
-| 每条记录以 `\n` 结尾、长度 ≤ `capacity` | `input` 生产 | `ring::append` 的 `debug_assert` 前提 | `seek` 只按换行符定位 |
+| 每条记录以 `\n` 结尾、长度 ≤ `capacity` | `input` 保证 | `ring` 跨窗口切分时的 `debug_assert` 前提 | `seek` 只按换行符定位 |
 | 数据区任意时刻都是完整记录的串（不跨环拆行） | `ring` 的换行填充 | `ring` | `seek` 的扫描、`follow` 的输出 |
 | 「头部 + 数据」来自同一一致状态 | `Reader::with_snapshot` | `ring` 的 flock 协议 | `follow`、`info`、`seek` 调用方 |
 | 同一文件同一时刻只有一个写者 | `Ring::open` 的 `<FILE>.lock` flock | `ring` | `cli` 的帮助文案 |
@@ -147,3 +148,13 @@ cargo test                 # 单元 + 黑盒 + 对抗
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+## 9. 性能要点
+
+- **写路径**：常见情况是「整批一次拷贝 + 一次 pwrite」——`input` 快路径整块拷贝 payload，
+  `ring` 在整批不跨环形窗口时直接一次写；只有跨越文件尾时才扫描换行、按记录切分并填充绕回。
+- **读路径**：锁内只读头部 + 拷贝一个 chunk，锁外输出；`-f` 轮询默认 20 ms。
+- **批大小**：写者攒满 256 KiB 落一批，低速率输入 20 ms 兜底（`--sync` 为 100 ms）。
+- **参考数据**（本机 NVMe，release）：写 200 MiB 短行日志 ≈ 0.07 s（≈2.7 GB/s）；
+  dump 64 MiB ≈ 25 ms；`-f` 端到端延迟 16–20 ms；空闲跟随 CPU < 0.4%。
+
