@@ -175,7 +175,7 @@ impl<'a, W: Write> Tailer<'a, W> {
     /// 只输出完整记录，半条记录留在 `pending` 里等后续数据。
     fn write_records(&mut self, chunk: &[u8]) -> io::Result<()> {
         self.pending.extend_from_slice(chunk);
-        if let Some(i) = self.pending.iter().rposition(|&b| b == b'\n') {
+        if let Some(i) = memchr::memrchr(b'\n', &self.pending) {
             self.out.write_all(&self.pending[..=i])?;
             self.pending.drain(..=i);
         }
@@ -231,7 +231,7 @@ fn scan_to_next_line(reader: &Reader, from: u64, upto: u64) -> io::Result<u64> {
     while abs < upto {
         let n = ((upto - abs) as usize).min(CHUNK);
         reader.read_exact_abs(abs, &mut buf[..n])?;
-        if let Some(i) = buf[..n].iter().position(|&b| b == b'\n') {
+        if let Some(i) = memchr::memchr(b'\n', &buf[..n]) {
             return Ok(abs + i as u64 + 1);
         }
         abs += n as u64;
@@ -256,13 +256,13 @@ fn scan_back(reader: &Reader, end: u64, oldest: u64, n: u64) -> io::Result<Optio
         let chunk = ((abs - oldest) as usize).min(CHUNK);
         let start = abs - chunk as u64;
         reader.read_exact_abs(start, &mut buf[..chunk])?;
-        for i in (0..chunk).rev() {
-            if buf[i] == b'\n' {
-                seen += 1;
-                if seen == target {
-                    return Ok(Some(start + i as u64 + 1));
-                }
+        let mut slice = &buf[..chunk];
+        while let Some(i) = memchr::memrchr(b'\n', slice) {
+            seen += 1;
+            if seen == target {
+                return Ok(Some(start + i as u64 + 1));
             }
+            slice = &slice[..i];
         }
         abs = start;
     }

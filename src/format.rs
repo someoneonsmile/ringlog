@@ -29,6 +29,9 @@
 //!
 //! 不变量：`total_written % capacity == write_pos`。
 
+/// CRC32C（Castagnoli）校验，见 RFC 3720 B.4。
+pub use crc32c::crc32c;
+
 pub const HEADER_PAGE: u64 = 4096;
 pub const DATA_OFFSET: u64 = HEADER_PAGE;
 pub const SLOT_SIZE: u64 = 64;
@@ -41,34 +44,6 @@ const MAGIC: u64 = u64::from_le_bytes(*b"RINGLOG1");
 const VERSION: u32 = 1;
 /// crc 覆盖的字节范围终点。
 const CRC_RANGE_END: usize = 56;
-
-const CRC32C_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = if crc & 1 != 0 {
-                0x82F6_3B78 ^ (crc >> 1)
-            } else {
-                crc >> 1
-            };
-            bit += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
-
-pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in data {
-        crc = CRC32C_TABLE[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
-    }
-    !crc
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {

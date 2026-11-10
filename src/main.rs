@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use humansize::{BINARY, format_size};
 use ringlog::cli::{self, Cli, Mode};
 use ringlog::follow;
 use ringlog::input::LineSplitter;
@@ -25,22 +26,16 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if args
-        .iter()
-        .any(|a| matches!(a.to_str(), Some("-h" | "--help")))
-    {
-        write_stdout(cli::HELP);
-        return ExitCode::SUCCESS;
-    }
-    if args
-        .iter()
-        .any(|a| matches!(a.to_str(), Some("-V" | "--version")))
-    {
-        write_stdout(&format!("ringlog {}\n", env!("CARGO_PKG_VERSION")));
-        return ExitCode::SUCCESS;
-    }
+    // clap 负责 --help / --version（退出码 0）和参数错误（退出码 2）。
+    let cli = match cli::parse(args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            return ExitCode::from(err.exit_code() as u8);
+        }
+    };
 
-    match run(args) {
+    match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         // 下游（head、grep -m 等）提前关闭管道是正常用法，安静退出。
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
@@ -64,15 +59,9 @@ fn write_stderr(text: &str) {
     let _ = io::stderr().write_all(text.as_bytes());
 }
 
-fn run(args: Vec<OsString>) -> io::Result<()> {
-    let cli = cli::parse(args).map_err(|msg| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{msg}（用 --help 查看用法）"),
-        )
-    })?;
+fn run(cli: &Cli) -> io::Result<()> {
     match cli.mode {
-        Mode::Write => write_mode(&cli),
+        Mode::Write => write_mode(cli),
         Mode::Read => {
             let reader = Reader::open(&cli.path)?;
             follow::run(&reader, cli.follow, cli.lines, cli.interval)
@@ -194,34 +183,24 @@ fn info_mode(path: &Path) -> io::Result<()> {
         text,
         "文件大小:   {} 字节（{}）",
         file_len,
-        human_size(file_len)
+        format_size(file_len, BINARY)
     );
     let _ = writeln!(
         text,
         "数据区容量: {} 字节（{}）",
         header.capacity,
-        human_size(header.capacity)
+        format_size(header.capacity, BINARY)
     );
     let _ = writeln!(text, "写位置:     {} 字节", header.write_pos);
     let _ = writeln!(text, "累计写入:   {} 字节", header.total_written);
-    let _ = writeln!(text, "有效数据:   {} 字节（{}）", used, human_size(used));
+    let _ = writeln!(
+        text,
+        "有效数据:   {} 字节（{}）",
+        used,
+        format_size(used, BINARY)
+    );
     let _ = writeln!(text, "头部序号:   {}", header.seq);
     let _ = writeln!(text, "重置纪元:   {}", header.epoch);
     write_stdout(&text);
     Ok(())
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }

@@ -32,24 +32,14 @@ impl LineSplitter {
     }
 
     pub fn feed(&mut self, chunk: &[u8]) {
-        let max_carry = self.max_record - 1;
-        for &byte in chunk {
-            if byte == b'\n' {
-                let start = self.payload.len();
-                self.payload.extend_from_slice(&self.carry);
-                self.payload.push(b'\n');
-                self.records.push((start, self.payload.len() - start));
-                self.carry.clear();
-                if self.truncated {
-                    self.truncated_lines += 1;
-                    self.truncated = false;
-                }
-            } else if self.carry.len() < max_carry {
-                self.carry.push(byte);
-            } else {
-                self.truncated = true;
-            }
+        let mut last = 0;
+        for i in memchr::memchr_iter(b'\n', chunk) {
+            self.push_carry(&chunk[last..i]);
+            self.end_record();
+            last = i + 1;
         }
+        // 末尾没有换行符的半行留在 carry 里等下一块数据。
+        self.push_carry(&chunk[last..]);
     }
 
     /// 输入结束：把没有换行符收尾的最后一行补上 `\n`。
@@ -57,6 +47,25 @@ impl LineSplitter {
         if self.carry.is_empty() && !self.truncated {
             return;
         }
+        self.end_record();
+    }
+
+    /// 把一段不含换行符的字节放进 carry；超出记录上限的部分丢弃并标记截断。
+    fn push_carry(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let room = self.max_record - 1 - self.carry.len();
+        if bytes.len() <= room {
+            self.carry.extend_from_slice(bytes);
+        } else {
+            self.carry.extend_from_slice(&bytes[..room]);
+            self.truncated = true;
+        }
+    }
+
+    /// 收尾当前行：carry + `\n` 组成一条完整记录。
+    fn end_record(&mut self) {
         let start = self.payload.len();
         self.payload.extend_from_slice(&self.carry);
         self.payload.push(b'\n');
