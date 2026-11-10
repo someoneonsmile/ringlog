@@ -1,7 +1,7 @@
 # 架构评审：问题清单与修复方案
 
-- 状态：**待评审**（本文只做分析，尚未改动任何代码）
-- 基线：`cargo test` 67 通过（单测 20 + 黑盒 27 + 对抗 20）、`cargo clippy --all-targets` 无告警
+- 状态：**已实施**（Phase 1-4 完成，见文末「实施记录」；最终结构见 [architecture.md](architecture.md)）
+- 基线（重构前）：`cargo test` 67 通过（单测 20 + 黑盒 27 + 对抗 20）、`cargo clippy --all-targets` 无告警
 - 范围：`src/` 7 个文件（约 1 500 行）+ `tests/` 2 个文件（约 2 120 行）
 - **不含**：功能 bug 排查、文件格式变更、CLI 行为变更
 - 目的：先就"问题与方案"达成一致，再分阶段重构
@@ -285,3 +285,29 @@ tests/cli.rs、tests/adversarial.rs：不链接 lib，只通过 CARGO_BIN_EXE_ri
 - 不把 `follow` 做成 `Iterator`/async，不改"锁内只拷贝、锁外写 stdout"的设计。
 - 不为单测覆盖率达到某个数字而写测试；只补关键边界（定位、分帧、模式互斥）。
 - 不把 `tests/adversarial.rs` 的"独立格式解析"合并进 lib——那是黑盒测试的独立 oracle，有意重复。
+
+## 8. 实施记录
+
+分支 `refactor/architecture`，按阶段提交；除文档外无功能变更（golden 对照逐字节一致）。
+
+| commit | 阶段 | 内容 |
+| --- | --- | --- |
+| `d1b8d62` | — | 本文档 |
+| `e02982a` | Phase 1 | `Cli` → `Mode`/`StartPos`；`Batch`/`Record`；尺寸几何收敛到 `format`；crc32c 不再外置 |
+| `dacfd25` | Phase 2 | 抽 `seek`（+5 单测）；`main` 拆 `app::{writer,info,report}`；`take(final_chunk)` |
+| `d4a8709` | Phase 3 | `cli`/`follow` 迁入 bin；lib 收缩为引擎；删 `lib::warn`；错误分类集中到 `error` |
+| `f11d723` | Phase 4 | `Ring::open` 拆成 4 个函数；`tests/common` 共享脚手架 |
+
+与方案的差异（落地时按实际情况调整）：
+
+- **D2**：不加 `ReadAt` trait；`seek` 单测直接用 `Ring` 造真实临时文件，数据即真实环形内容。
+- **D3**：不引入自定义错误类型；保留 `io::Error`，只新增 `error.rs` 收敛构造与 `is_user_error`。
+- **D4**：`ring.rs` 不拆目录；只把 `open` 拆成 `acquire_writer_lock / open_file / initialize / resume`。
+- 额外：bin 也加上 `#![deny(unsafe_code)]`（原方案在 S4 里列为低优先）。
+
+最终验证：
+
+- `cargo test`：**75 通过**（lib 单测 16 + bin 单测 12 + 黑盒 27 + 对抗 20）
+- `cargo clippy --all-targets -- -D warnings`、`cargo fmt --check`：干净
+- golden 对照：74 项产物（文件 sha256、各模式 stdout/stderr/退出码、帮助与错误路径）
+  与重构前**逐字节一致**

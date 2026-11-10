@@ -158,6 +158,25 @@ slot 布局（小端）：
 | 1 | I/O 错误 |
 | 2 | 用法错误、文件大小/头部无效等数据错误 |
 
+## 代码结构
+
+`ringlog` 库只做引擎，命令行应用在 bin 层：
+
+- `src/format.rs` / `src/ring.rs` / `src/input.rs` / `src/seek.rs` / `src/error.rs`：
+  文件格式、环形读写、行分帧、窗口定位、错误分类，**不接触终端**；
+- `src/main.rs` + `src/app/`：参数解析（`cli`）、写入泵（`writer`）、跟随输出（`follow`）、
+  元信息（`info`）；stdout / stderr 只经过 `app/report`。
+
+```
+src/
+├── lib.rs format.rs ring.rs input.rs seek.rs error.rs   # 引擎（无终端 I/O）
+├── main.rs                                             # 入口：parse → 分派 → 退出码
+└── app/  cli.rs writer.rs follow.rs info.rs report.rs   # 应用层
+```
+
+分层规则、模块职责与跨模块契约见 [docs/architecture.md](docs/architecture.md)；
+这次重构的问题清单与决策见 [docs/architecture-review.md](docs/architecture-review.md)。
+
 ## 构建与测试
 
 ```bash
