@@ -13,8 +13,10 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::format::{
-    DATA_OFFSET, HEADER_PAGE, Header, MIN_DATA_CAPACITY, SLOT_BYTES, SLOT_OFFSETS,
+    DATA_OFFSET, HEADER_PAGE, Header, MIN_DATA_CAPACITY, MIN_TOTAL_SIZE, SLOT_BYTES, SLOT_OFFSETS,
+    data_capacity, file_size,
 };
+use crate::input::Batch;
 
 /// 环绕填充每次写入的块大小。
 const PAD_CHUNK: usize = 64 * 1024;
@@ -116,17 +118,11 @@ impl Ring {
         let existing = read_header(&file)?;
 
         let (capacity, write_pos, total_written, seq, epoch) = if force || len == 0 {
-            let capacity = total_size
-                .checked_sub(HEADER_PAGE)
-                .filter(|c| *c >= MIN_DATA_CAPACITY)
-                .ok_or_else(|| {
-                    usage(format!(
-                        "文件总大小至少需要 {} 字节（4 KiB 头区 + {} 字节数据区），当前 -s 为 {} 字节",
-                        HEADER_PAGE + MIN_DATA_CAPACITY,
-                        MIN_DATA_CAPACITY,
-                        total_size
-                    ))
-                })?;
+            let capacity = data_capacity(total_size).ok_or_else(|| {
+                usage(format!(
+                    "文件总大小至少需要 {MIN_TOTAL_SIZE} 字节（4 KiB 头区 + {MIN_DATA_CAPACITY} 字节数据区），当前 -s 为 {total_size} 字节"
+                ))
+            })?;
             file.set_len(total_size)?;
             let seq = existing.map_or(1, |h| h.seq.wrapping_add(1));
             let epoch = existing.map_or(1, |h| h.epoch.wrapping_add(1).max(1));
@@ -137,16 +133,13 @@ impl Ring {
             }
             (capacity, 0, 0, seq, epoch)
         } else {
-            let capacity = len
-                .checked_sub(HEADER_PAGE)
-                .filter(|c| *c >= MIN_DATA_CAPACITY)
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "{} 只有 {} 字节，不是有效的 ringlog 文件",
-                        path.display(),
-                        len
-                    ))
-                })?;
+            let capacity = data_capacity(len).ok_or_else(|| {
+                invalid(format!(
+                    "{} 只有 {} 字节，不是有效的 ringlog 文件",
+                    path.display(),
+                    len
+                ))
+            })?;
             if total_size != len {
                 return Err(usage(format!(
                     "{} 现有大小 {} 字节，与 -s {} 不一致；确认要重建请加 --force",
@@ -194,20 +187,20 @@ impl Ring {
         self.capacity
     }
 
-    /// 追加一批记录。`records` 是 `payload` 中 `(起点, 长度)` 的区间，
-    /// 每条记录必须以 `\n` 结尾，且长度不超过 `capacity`。
-    pub fn append(&mut self, payload: &[u8], records: &[(usize, usize)]) -> io::Result<()> {
-        if records.is_empty() {
+    /// 追加一批记录。每条记录必须以 `\n` 结尾，且长度不超过 `capacity`。
+    pub fn append(&mut self, batch: Batch) -> io::Result<()> {
+        if batch.is_empty() {
             return Ok(());
         }
         self.file.lock()?;
-        let result = self.append_locked(payload, records);
+        let result = self.append_locked(&batch);
         let unlock_result = self.file.unlock();
         result?;
         unlock_result
     }
 
-    fn append_locked(&mut self, payload: &[u8], records: &[(usize, usize)]) -> io::Result<()> {
+    fn append_locked(&mut self, batch: &Batch) -> io::Result<()> {
+        let payload = &batch.payload;
         let cap = self.capacity;
         let mut pos = self.write_pos;
         let mut total = self.total_written;
@@ -225,7 +218,8 @@ impl Ring {
         }
 
         let mut ops: Vec<Op> = Vec::new();
-        for &(start, len) in records {
+        for record in &batch.records {
+            let (start, len) = (record.start, record.len);
             let len_u = len as u64;
             debug_assert!(len_u <= cap, "单条记录不能超过数据区容量");
             if cap - pos < len_u {
@@ -328,7 +322,7 @@ impl Reader {
                 path.display()
             ))
         })?;
-        if HEADER_PAGE + header.capacity != len {
+        if file_size(header.capacity) != len {
             return Err(invalid(format!(
                 "{} 的文件大小与头区容量不一致（文件可能被截断或重建）",
                 path.display()

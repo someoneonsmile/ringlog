@@ -21,18 +21,29 @@ const CHUNK: usize = 64 * 1024;
 /// “跟读落后”告警的最小间隔，避免下游慢时刷屏。
 const WARN_INTERVAL: Duration = Duration::from_secs(1);
 
-/// 输出有效数据的最近 `lines` 行；`lines = Some(0)` 表示跳过历史、只跟新数据。
+/// 首屏从哪开始输出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartPos {
+    /// 输出全部有效数据。
+    Oldest,
+    /// 跳过历史，只输出之后的新数据。
+    Newest,
+    /// 输出最近 `n` 行；有效数据不足 `n` 行时输出全部。
+    Last(u64),
+}
+
+/// 按 `start` 决定首屏起点，`follow` 为真时持续输出新数据。
 pub fn run(
     reader: &Reader,
     follow: bool,
-    lines: Option<u64>,
+    start: StartPos,
     interval: Duration,
 ) -> io::Result<()> {
     let stdout = io::stdout();
     let mut tailer = Tailer::new(
         reader,
         BufWriter::with_capacity(CHUNK, stdout.lock()),
-        lines,
+        start,
     );
     tailer.init()?;
 
@@ -61,7 +72,7 @@ struct Tailer<'a, W: Write> {
     consumed: u64,
     /// 已消费但尚未构成完整记录（没有换行符）的尾部字节。
     pending: Vec<u8>,
-    lines: Option<u64>,
+    start: StartPos,
     /// 当前跟随的“重置纪元”，与头部不一致说明文件被 `--force` 重建过。
     epoch: u64,
     /// 上次打印“落后丢数据”告警之后累计丢失的字节数（避免告警刷屏）。
@@ -76,13 +87,13 @@ enum Warning {
 }
 
 impl<'a, W: Write> Tailer<'a, W> {
-    fn new(reader: &'a Reader, out: W, lines: Option<u64>) -> Self {
+    fn new(reader: &'a Reader, out: W, start: StartPos) -> Self {
         Self {
             reader,
             out,
             consumed: 0,
             pending: Vec::new(),
-            lines,
+            start,
             epoch: 0,
             lost_bytes: 0,
             last_warn: None,
@@ -92,7 +103,7 @@ impl<'a, W: Write> Tailer<'a, W> {
     fn init(&mut self) -> io::Result<()> {
         let (consumed, epoch) = self
             .reader
-            .with_snapshot(|r, h| Ok((locate_start(r, h, self.lines)?, h.epoch)))?;
+            .with_snapshot(|r, h| Ok((locate_start(r, h, self.start)?, h.epoch)))?;
         self.consumed = consumed;
         self.epoch = epoch;
         Ok(())
@@ -114,7 +125,7 @@ impl<'a, W: Write> Tailer<'a, W> {
             // 纪元变化说明文件被 --force 重建；total_written 回退是兜底判断。
             if h.epoch != expected_epoch || end < start {
                 // 重建后的内容都算“新数据”，从头输出有效部分。
-                let consumed = locate_start(r, h, None)?;
+                let consumed = locate_start(r, h, StartPos::Oldest)?;
                 return Ok((consumed, 0, Some(Warning::Reset), Some(h.epoch)));
             }
             let mut available = end - start;
@@ -192,22 +203,22 @@ impl<'a, W: Write> Tailer<'a, W> {
 }
 
 /// 计算首屏起点（逻辑偏移 = 累计写入字节数）。
-fn locate_start(reader: &Reader, header: &Header, lines: Option<u64>) -> io::Result<u64> {
+fn locate_start(reader: &Reader, header: &Header, start: StartPos) -> io::Result<u64> {
     let end = header.total_written;
     let oldest = end.saturating_sub(header.capacity);
     // 物理偏移 0 处永远是记录起点：初始化后从这里开始写，每次绕回也是从 0 写新记录。
     // 因此窗口起点恰好落在 0 偏移时（oldest % capacity == 0）不能丢第一条记录。
     let aligned = oldest.is_multiple_of(header.capacity);
-    match lines {
-        None => {
+    match start {
+        StartPos::Oldest => {
             if aligned {
                 Ok(oldest)
             } else {
                 scan_to_next_line(reader, oldest, end)
             }
         }
-        Some(0) => Ok(end),
-        Some(n) => match scan_back(reader, end, oldest, n)? {
+        StartPos::Newest => Ok(end),
+        StartPos::Last(n) => match scan_back(reader, end, oldest, n)? {
             // scan_back 返回的是换行符之后的位置，天然对齐，直接使用。
             Some(start) => Ok(start),
             // 窗口内不足 n 行：从最旧数据开始，但起点可能落在半条记录上。

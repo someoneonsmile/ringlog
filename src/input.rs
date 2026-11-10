@@ -4,12 +4,32 @@
 //! - 超长行截断，保留行首（`capacity - 1` 字节）+ 换行，并计数告警；
 //! - 输入末尾缺少换行符时补一个，保证每条记录都以 `\n` 结尾。
 
+/// 一条记录在 [`Batch::payload`] 中的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Record {
+    pub start: usize,
+    pub len: usize,
+}
+
+/// 一批已成形、以 `\n` 结尾的记录。`records` 的区间全部落在 `payload` 内。
+#[derive(Debug, Default)]
+pub struct Batch {
+    pub payload: Vec<u8>,
+    pub records: Vec<Record>,
+}
+
+impl Batch {
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
 /// 单条记录长度上限 = 数据区容量（含结尾换行），据此决定行首保留字节数。
 #[derive(Debug)]
 pub struct LineSplitter {
     max_record: usize,
     payload: Vec<u8>,
-    records: Vec<(usize, usize)>,
+    records: Vec<Record>,
     /// 当前行尚未结束的字节。
     carry: Vec<u8>,
     /// 当前行是否已超长、后续字节被丢弃。
@@ -69,7 +89,10 @@ impl LineSplitter {
         let start = self.payload.len();
         self.payload.extend_from_slice(&self.carry);
         self.payload.push(b'\n');
-        self.records.push((start, self.payload.len() - start));
+        self.records.push(Record {
+            start,
+            len: self.payload.len() - start,
+        });
         self.carry.clear();
         if self.truncated {
             self.truncated_lines += 1;
@@ -78,11 +101,11 @@ impl LineSplitter {
     }
 
     /// 取走已经成形的记录（未结束的半行留在内部）。
-    pub fn take(&mut self) -> (Vec<u8>, Vec<(usize, usize)>) {
-        (
-            std::mem::take(&mut self.payload),
-            std::mem::take(&mut self.records),
-        )
+    pub fn take(&mut self) -> Batch {
+        Batch {
+            payload: std::mem::take(&mut self.payload),
+            records: std::mem::take(&mut self.records),
+        }
     }
 
     pub fn payload_len(&self) -> usize {
@@ -113,14 +136,13 @@ mod tests {
 
     fn split_all(capacity: u64, input: &[u8]) -> Vec<Vec<u8>> {
         let mut splitter = LineSplitter::new(capacity);
-        let (payload, records) = {
-            splitter.feed(input);
-            splitter.finish();
-            splitter.take()
-        };
-        records
+        splitter.feed(input);
+        splitter.finish();
+        let batch = splitter.take();
+        batch
+            .records
             .iter()
-            .map(|&(start, len)| payload[start..start + len].to_vec())
+            .map(|r| batch.payload[r.start..r.start + r.len].to_vec())
             .collect()
     }
 
@@ -144,9 +166,15 @@ mod tests {
         splitter.feed(b"hel");
         splitter.feed(b"lo\nwor");
         splitter.feed(b"ld\n");
-        let (payload, records) = splitter.take();
-        assert_eq!(payload, b"hello\nworld\n".to_vec());
-        assert_eq!(records, vec![(0, 6), (6, 6)]);
+        let batch = splitter.take();
+        assert_eq!(batch.payload, b"hello\nworld\n".to_vec());
+        assert_eq!(
+            batch.records,
+            vec![
+                Record { start: 0, len: 6 },
+                Record { start: 6, len: 6 }
+            ]
+        );
     }
 
     #[test]
@@ -157,6 +185,13 @@ mod tests {
         let mut splitter = LineSplitter::new(cap);
         splitter.feed(b"0123456789abcdef\n");
         assert_eq!(splitter.truncated_lines(), 1);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_batch() {
+        let mut splitter = LineSplitter::new(4096);
+        splitter.finish();
+        assert!(splitter.take().is_empty());
     }
 
     #[test]

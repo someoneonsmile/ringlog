@@ -29,8 +29,7 @@
 //!
 //! 不变量：`total_written % capacity == write_pos`。
 
-/// CRC32C（Castagnoli）校验，见 RFC 3720 B.4。
-pub use crc32c::crc32c;
+use crc32c::crc32c;
 
 pub const HEADER_PAGE: u64 = 4096;
 pub const DATA_OFFSET: u64 = HEADER_PAGE;
@@ -39,6 +38,20 @@ pub const SLOT_BYTES: usize = SLOT_SIZE as usize;
 pub const SLOT_OFFSETS: [u64; 2] = [0, SLOT_SIZE];
 /// 数据区最小容量（连同 4 KiB 头区，文件至少 8 KiB）。
 pub const MIN_DATA_CAPACITY: u64 = 4096;
+/// 最小文件总大小。参数校验与打开文件都以它为准，避免几处各算一遍。
+pub const MIN_TOTAL_SIZE: u64 = HEADER_PAGE + MIN_DATA_CAPACITY;
+
+/// 由文件总大小推导数据区容量；不满足最小几何要求时返回 `None`。
+pub fn data_capacity(total_size: u64) -> Option<u64> {
+    total_size
+        .checked_sub(HEADER_PAGE)
+        .filter(|capacity| *capacity >= MIN_DATA_CAPACITY)
+}
+
+/// 由数据区容量推导文件总大小。
+pub fn file_size(capacity: u64) -> u64 {
+    HEADER_PAGE + capacity
+}
 
 const MAGIC: u64 = u64::from_le_bytes(*b"RINGLOG1");
 const VERSION: u32 = 1;

@@ -61,20 +61,21 @@ fn write_stderr(text: &str) {
 
 fn run(cli: &Cli) -> io::Result<()> {
     match cli.mode {
-        Mode::Write => write_mode(cli),
-        Mode::Read => {
+        Mode::Write { size, sync, force } => write_mode(&cli.path, size, force, sync),
+        Mode::Read {
+            follow,
+            start,
+            interval,
+        } => {
             let reader = Reader::open(&cli.path)?;
-            follow::run(&reader, cli.follow, cli.lines, cli.interval)
+            follow::run(&reader, follow, start, interval)
         }
         Mode::Info => info_mode(&cli.path),
     }
 }
 
-fn write_mode(cli: &Cli) -> io::Result<()> {
-    let size = cli
-        .size
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "写入模式缺少 -s"))?;
-    let mut ring = Ring::open(&cli.path, size, cli.force, cli.sync)?;
+fn write_mode(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
+    let mut ring = Ring::open(path, size, force, sync)?;
 
     // stdin 由独立线程读取，主线程按「攒满一批」或「100ms 超时」落盘。
     // 这样低速率输入最多滞后约 100ms 就能被跟随端看到，而不是等到 EOF。
@@ -169,8 +170,7 @@ fn flush_batch(ring: &mut Ring, splitter: &mut LineSplitter, force: bool) -> io:
     if !force && splitter.payload_len() < FLUSH_BYTES && splitter.records_len() < FLUSH_RECORDS {
         return Ok(());
     }
-    let (payload, records) = splitter.take();
-    ring.append(&payload, &records)
+    ring.append(splitter.take())
 }
 
 fn info_mode(path: &Path) -> io::Result<()> {

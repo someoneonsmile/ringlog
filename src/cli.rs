@@ -11,7 +11,8 @@ use std::time::Duration;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
-use crate::format::{HEADER_PAGE, MIN_DATA_CAPACITY};
+use crate::follow::StartPos;
+use crate::format::MIN_TOTAL_SIZE;
 
 const ABOUT: &str = "固定大小的单文件环形日志";
 
@@ -43,10 +44,18 @@ const AFTER_HELP: &str = "\
   - 单行超过数据区容量时截断并保留行首，写入进程退出时汇总告警。
   - 读取进程落后超过数据区容量时告警并跳到最旧数据继续。";
 
+/// 命令行模式。每种模式只携带自己用得到的参数，非法组合无法表达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Write,
-    Read,
+    /// 写入：stdin 管道 → 环形文件。
+    Write { size: u64, sync: bool, force: bool },
+    /// 读取：先输出已有数据，可选持续跟随。
+    Read {
+        follow: bool,
+        start: StartPos,
+        interval: Duration,
+    },
+    /// 打印文件元信息。
     Info,
 }
 
@@ -54,14 +63,6 @@ pub enum Mode {
 pub struct Cli {
     pub path: PathBuf,
     pub mode: Mode,
-    /// 仅写入模式：文件总大小。
-    pub size: Option<u64>,
-    /// 仅读取模式：最近行数；`Some(0)` 表示只看新数据。
-    pub lines: Option<u64>,
-    pub follow: bool,
-    pub sync: bool,
-    pub force: bool,
-    pub interval: Duration,
 }
 
 #[derive(Debug, Parser)]
@@ -155,35 +156,34 @@ impl Args {
             if sync || force {
                 return Err(usage_error("--sync / --force 只用于写入模式"));
             }
-            if !follow && lines == Some(0) {
-                return Err(usage_error("-n 0 只能与 -f 一起使用（表示只看新数据）"));
+            let start = match lines {
+                None => StartPos::Oldest,
+                Some(0) if follow => StartPos::Newest,
+                Some(0) => {
+                    return Err(usage_error("-n 0 只能与 -f 一起使用（表示只看新数据）"));
+                }
+                Some(n) => StartPos::Last(n),
+            };
+            Mode::Read {
+                follow,
+                start,
+                interval: Duration::from_millis(interval_ms),
             }
-            Mode::Read
         } else {
             let size = size.ok_or_else(|| {
                 usage_error(
                     "写入模式需要 -s SIZE（例如 -s 64M）；读取用 -f / -n，查看信息用 --info",
                 )
             })?;
-            let min = HEADER_PAGE + MIN_DATA_CAPACITY;
-            if size < min {
+            if size < MIN_TOTAL_SIZE {
                 return Err(usage_error(format!(
-                    "-s 至少为 {min} 字节（4 KiB 头区 + 4 KiB 数据区）"
+                    "-s 至少为 {MIN_TOTAL_SIZE} 字节（4 KiB 头区 + 4 KiB 数据区）"
                 )));
             }
-            Mode::Write
+            Mode::Write { size, sync, force }
         };
 
-        Ok(Cli {
-            path: file,
-            mode,
-            size,
-            lines,
-            follow,
-            sync,
-            force,
-            interval: Duration::from_millis(interval_ms),
-        })
+        Ok(Cli { path: file, mode })
     }
 }
 
@@ -228,8 +228,14 @@ mod tests {
     fn write_mode_requires_size() {
         assert!(parse_args(&["/tmp/x.ring"]).is_err());
         let cli = parse_args(&["-s", "64K", "/tmp/x.ring"]).unwrap();
-        assert_eq!(cli.mode, Mode::Write);
-        assert_eq!(cli.size, Some(64 * 1024));
+        assert_eq!(
+            cli.mode,
+            Mode::Write {
+                size: 64 * 1024,
+                sync: false,
+                force: false
+            }
+        );
     }
 
     #[test]
@@ -240,23 +246,50 @@ mod tests {
     #[test]
     fn follow_mode_without_size() {
         let cli = parse_args(&["-f", "/tmp/x.ring"]).unwrap();
-        assert_eq!(cli.mode, Mode::Read);
-        assert!(cli.follow);
-        assert_eq!(cli.lines, None);
+        assert_eq!(
+            cli.mode,
+            Mode::Read {
+                follow: true,
+                start: StartPos::Oldest,
+                interval: Duration::from_millis(100),
+            }
+        );
     }
 
     #[test]
     fn tail_mode() {
         let cli = parse_args(&["-n", "10", "/tmp/x.ring"]).unwrap();
-        assert_eq!(cli.mode, Mode::Read);
-        assert!(!cli.follow);
-        assert_eq!(cli.lines, Some(10));
+        assert_eq!(
+            cli.mode,
+            Mode::Read {
+                follow: false,
+                start: StartPos::Last(10),
+                interval: Duration::from_millis(100),
+            }
+        );
+    }
+
+    #[test]
+    fn follow_poll_interval_is_parsed() {
+        let cli = parse_args(&["-f", "--interval-ms", "250", "/tmp/x.ring"]).unwrap();
+        let Mode::Read { interval, .. } = cli.mode else {
+            panic!("应为读取模式，实际 {:?}", cli.mode);
+        };
+        assert_eq!(interval, Duration::from_millis(250));
     }
 
     #[test]
     fn n_zero_requires_follow() {
         assert!(parse_args(&["-n", "0", "/tmp/x.ring"]).is_err());
-        assert!(parse_args(&["-f", "-n", "0", "/tmp/x.ring"]).is_ok());
+        let cli = parse_args(&["-f", "-n", "0", "/tmp/x.ring"]).unwrap();
+        assert_eq!(
+            cli.mode,
+            Mode::Read {
+                follow: true,
+                start: StartPos::Newest,
+                interval: Duration::from_millis(100),
+            }
+        );
     }
 
     #[test]
