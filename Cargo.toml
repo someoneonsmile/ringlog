@@ -1,0 +1,13 @@
+[package]
+name = "ringlog"
+version = "0.1.0"
+edition = "2024"
+description = "固定大小的单文件环形日志：管道写入，写满覆盖最旧数据，支持 -f 跟随"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
