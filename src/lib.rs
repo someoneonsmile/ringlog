@@ -11,6 +11,7 @@ pub mod follow;
 pub mod format;
 pub mod input;
 pub mod ring;
+pub mod seek;
 
 /// 向 stderr 打一条告警。stderr 被关闭（告警通道不可用）时静默忽略，
 /// 避免日志工具因为无法输出告警而崩溃。

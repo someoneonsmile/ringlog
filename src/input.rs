@@ -63,7 +63,7 @@ impl LineSplitter {
     }
 
     /// 输入结束：把没有换行符收尾的最后一行补上 `\n`。
-    pub fn finish(&mut self) {
+    fn finish(&mut self) {
         if self.carry.is_empty() && !self.truncated {
             return;
         }
@@ -100,8 +100,12 @@ impl LineSplitter {
         }
     }
 
-    /// 取走已经成形的记录（未结束的半行留在内部）。
-    pub fn take(&mut self) -> Batch {
+    /// 取走已经成形的记录。`final_chunk` 表示输入已结束：把没有换行符的最后一行
+    /// 补上 `\n` 一起取走；否则未结束的半行留在内部等下一块数据。
+    pub fn take(&mut self, final_chunk: bool) -> Batch {
+        if final_chunk {
+            self.finish();
+        }
         Batch {
             payload: std::mem::take(&mut self.payload),
             records: std::mem::take(&mut self.records),
@@ -137,8 +141,7 @@ mod tests {
     fn split_all(capacity: u64, input: &[u8]) -> Vec<Vec<u8>> {
         let mut splitter = LineSplitter::new(capacity);
         splitter.feed(input);
-        splitter.finish();
-        let batch = splitter.take();
+        let batch = splitter.take(true);
         batch
             .records
             .iter()
@@ -166,14 +169,11 @@ mod tests {
         splitter.feed(b"hel");
         splitter.feed(b"lo\nwor");
         splitter.feed(b"ld\n");
-        let batch = splitter.take();
+        let batch = splitter.take(false);
         assert_eq!(batch.payload, b"hello\nworld\n".to_vec());
         assert_eq!(
             batch.records,
-            vec![
-                Record { start: 0, len: 6 },
-                Record { start: 6, len: 6 }
-            ]
+            vec![Record { start: 0, len: 6 }, Record { start: 6, len: 6 }]
         );
     }
 
@@ -190,8 +190,21 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_batch() {
         let mut splitter = LineSplitter::new(4096);
-        splitter.finish();
-        assert!(splitter.take().is_empty());
+        assert!(splitter.take(true).is_empty());
+    }
+
+    #[test]
+    fn non_final_take_keeps_partial_line() {
+        let mut splitter = LineSplitter::new(4096);
+        splitter.feed(b"done\npar");
+        // 只取走已换行结束的完整记录，半行留在内部。
+        let batch = splitter.take(false);
+        assert_eq!(batch.payload, b"done\n".to_vec());
+        assert_eq!(batch.records, vec![Record { start: 0, len: 5 }]);
+        // 输入结束时补上换行，半行才成为记录。
+        let batch = splitter.take(true);
+        assert_eq!(batch.payload, b"par\n".to_vec());
+        assert_eq!(batch.records, vec![Record { start: 0, len: 4 }]);
     }
 
     #[test]
