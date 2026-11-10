@@ -18,10 +18,10 @@ use super::report;
 const INPUT_CHUNK: usize = 256 * 1024;
 /// 攒满这么多输入字节就落一批（高吞吐路径）。
 const FLUSH_BYTES: usize = 256 * 1024;
-/// 攒满这么多条记录就落一批。
-const FLUSH_RECORDS: usize = 4096;
 /// 低速率输入的兜底落盘间隔：保证跟随端最多滞后这么久就能看到数据。
-const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const FLUSH_INTERVAL: Duration = Duration::from_millis(20);
+/// `--sync` 时每批都要 fsync，兜底间隔放宽，避免低速率输入下频繁刷盘。
+const SYNC_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn run(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
     let mut ring = Ring::open(path, size, force, sync)?;
@@ -45,6 +45,12 @@ pub fn run(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
         }
     });
 
+    let flush_interval = if sync {
+        SYNC_FLUSH_INTERVAL
+    } else {
+        FLUSH_INTERVAL
+    };
+
     let mut splitter = LineSplitter::new(ring.capacity());
     let mut truncated_lines: u64 = 0;
     let mut warned_truncation = false;
@@ -52,7 +58,7 @@ pub fn run(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
     // 持续但低速率的数据流可能永远不会出现 100 ms 的空闲。
     let mut last_flush = Instant::now();
     let result = loop {
-        let wait = FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
+        let wait = flush_interval.saturating_sub(last_flush.elapsed());
         match receiver.recv_timeout(wait) {
             Ok(chunk) => {
                 splitter.feed(&chunk);
@@ -60,7 +66,7 @@ pub fn run(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
                 if let Err(e) = flush_batch(&mut ring, &mut splitter, false, false) {
                     break Err(e);
                 }
-                if last_flush.elapsed() >= FLUSH_INTERVAL
+                if last_flush.elapsed() >= flush_interval
                     && let Err(e) = flush_batch(&mut ring, &mut splitter, true, false)
                 {
                     break Err(e);
@@ -74,7 +80,7 @@ pub fn run(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
         }
-        if last_flush.elapsed() >= FLUSH_INTERVAL {
+        if last_flush.elapsed() >= flush_interval {
             last_flush = Instant::now();
         }
     };
@@ -119,7 +125,7 @@ fn flush_batch(
     force: bool,
     final_chunk: bool,
 ) -> io::Result<()> {
-    if !force && splitter.payload_len() < FLUSH_BYTES && splitter.records_len() < FLUSH_RECORDS {
+    if !force && splitter.payload_len() < FLUSH_BYTES {
         return Ok(());
     }
     ring.append(splitter.take(final_chunk))

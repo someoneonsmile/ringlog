@@ -17,7 +17,7 @@ use crate::format::{
     DATA_OFFSET, HEADER_PAGE, Header, MIN_DATA_CAPACITY, MIN_TOTAL_SIZE, SLOT_BYTES, SLOT_OFFSETS,
     data_capacity, file_size,
 };
-use crate::input::Batch;
+use memchr::memchr_iter;
 
 /// 环绕填充每次写入的块大小。
 const PAD_CHUNK: usize = 64 * 1024;
@@ -218,20 +218,59 @@ impl Ring {
         self.capacity
     }
 
-    /// 追加一批记录。每条记录必须以 `\n` 结尾，且长度不超过 `capacity`。
-    pub fn append(&mut self, batch: Batch) -> io::Result<()> {
-        if batch.is_empty() {
+    /// 追加一批记录。`payload` 必须是一串以 `\n` 结尾、长度不超过 `capacity` 的记录。
+    pub fn append(&mut self, payload: Vec<u8>) -> io::Result<()> {
+        if payload.is_empty() {
             return Ok(());
         }
         self.file.lock()?;
-        let result = self.append_locked(&batch);
+        let result = self.append_locked(&payload);
         let unlock_result = self.file.unlock();
         result?;
         unlock_result
     }
 
-    fn append_locked(&mut self, batch: &Batch) -> io::Result<()> {
-        let payload = &batch.payload;
+    fn append_locked(&mut self, payload: &[u8]) -> io::Result<()> {
+        let cap = self.capacity;
+
+        let (pos, total) = if payload.len() as u64 <= cap - self.write_pos {
+            // 快路径：整批都落在当前环形窗口内，一次写完，不需要按记录切分。
+            self.file
+                .write_all_at(payload, DATA_OFFSET + self.write_pos)?;
+            let written = payload.len() as u64;
+            (
+                (self.write_pos + written) % cap,
+                self.total_written + written,
+            )
+        } else {
+            self.place_across_wrap(payload)?
+        };
+
+        if self.sync {
+            // 先把数据落盘，再发布头部，避免头部指向未落盘的数据。
+            self.file.sync_data()?;
+        }
+
+        self.seq += 1;
+        let header = Header {
+            seq: self.seq,
+            epoch: self.epoch,
+            capacity: cap,
+            write_pos: pos,
+            total_written: total,
+        };
+        write_slot(&self.file, &header)?;
+        if self.sync {
+            self.file.sync_data()?;
+        }
+
+        self.write_pos = pos;
+        self.total_written = total;
+        Ok(())
+    }
+
+    /// 慢路径：整批会跨越环形边界，按记录边界摆放，必要时填满换行再绕回。
+    fn place_across_wrap(&self, payload: &[u8]) -> io::Result<(u64, u64)> {
         let cap = self.capacity;
         let mut pos = self.write_pos;
         let mut total = self.total_written;
@@ -249,8 +288,9 @@ impl Ring {
         }
 
         let mut ops: Vec<Op> = Vec::new();
-        for record in &batch.records {
-            let (start, len) = (record.start, record.len);
+        let mut start = 0;
+        for i in memchr_iter(b'\n', payload) {
+            let len = i + 1 - start;
             let len_u = len as u64;
             debug_assert!(len_u <= cap, "单条记录不能超过数据区容量");
             if cap - pos < len_u {
@@ -286,7 +326,9 @@ impl Ring {
             }
             pos = (pos + len_u) % cap;
             total += len_u;
+            start = i + 1;
         }
+        debug_assert_eq!(start, payload.len(), "payload 必须以换行结尾");
 
         for op in &ops {
             match op {
@@ -300,27 +342,7 @@ impl Ring {
                     .write_all_at(&payload[*start..*start + *len], *file_off)?,
             }
         }
-        if self.sync {
-            // 先把数据落盘，再发布头部，避免头部指向未落盘的数据。
-            self.file.sync_data()?;
-        }
-
-        self.seq += 1;
-        let header = Header {
-            seq: self.seq,
-            epoch: self.epoch,
-            capacity: cap,
-            write_pos: pos,
-            total_written: total,
-        };
-        write_slot(&self.file, &header)?;
-        if self.sync {
-            self.file.sync_data()?;
-        }
-
-        self.write_pos = pos;
-        self.total_written = total;
-        Ok(())
+        Ok((pos, total))
     }
 
     fn write_pad(&self, mut file_off: u64, mut len: u64) -> io::Result<()> {

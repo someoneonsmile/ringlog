@@ -88,8 +88,8 @@ struct Args {
     #[arg(short = 'n', long = "lines", value_name = "N")]
     lines: Option<u64>,
 
-    /// 跟随轮询间隔（毫秒，默认 100）
-    #[arg(long = "interval-ms", value_name = "MS", default_value_t = 100)]
+    /// 跟随轮询间隔（毫秒，默认 20）
+    #[arg(long = "interval-ms", value_name = "MS", default_value_t = 20)]
     interval_ms: u64,
 
     /// 每一批记录后 fsync（更抗断电，吞吐更低）
@@ -251,7 +251,7 @@ mod tests {
             Mode::Read {
                 follow: true,
                 start: StartPos::Oldest,
-                interval: Duration::from_millis(100),
+                interval: Duration::from_millis(20),
             }
         );
     }
@@ -264,7 +264,7 @@ mod tests {
             Mode::Read {
                 follow: false,
                 start: StartPos::Last(10),
-                interval: Duration::from_millis(100),
+                interval: Duration::from_millis(20),
             }
         );
     }
@@ -287,7 +287,7 @@ mod tests {
             Mode::Read {
                 follow: true,
                 start: StartPos::Newest,
-                interval: Duration::from_millis(100),
+                interval: Duration::from_millis(20),
             }
         );
     }

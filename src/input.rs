@@ -3,33 +3,17 @@
 //! - 每条记录长度不超过数据区容量（含换行符）；
 //! - 超长行截断，保留行首（`capacity - 1` 字节）+ 换行，并计数告警；
 //! - 输入末尾缺少换行符时补一个，保证每条记录都以 `\n` 结尾。
+//!
+//! 输出的 payload 保证「一串以 `\n` 结尾、长度不超过数据区容量的记录」，
+//! 但不登记记录边界：只有写入跨越文件尾时才需要按记录切分，交给 `ring` 扫描更省。
 
-/// 一条记录在 [`Batch::payload`] 中的位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Record {
-    pub start: usize,
-    pub len: usize,
-}
-
-/// 一批已成形、以 `\n` 结尾的记录。`records` 的区间全部落在 `payload` 内。
-#[derive(Debug, Default)]
-pub struct Batch {
-    pub payload: Vec<u8>,
-    pub records: Vec<Record>,
-}
-
-impl Batch {
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-}
+use memchr::memchr_iter;
 
 /// 单条记录长度上限 = 数据区容量（含结尾换行），据此决定行首保留字节数。
 #[derive(Debug)]
 pub struct LineSplitter {
     max_record: usize,
     payload: Vec<u8>,
-    records: Vec<Record>,
     /// 当前行尚未结束的字节。
     carry: Vec<u8>,
     /// 当前行是否已超长、后续字节被丢弃。
@@ -44,7 +28,6 @@ impl LineSplitter {
         Self {
             max_record,
             payload: Vec::new(),
-            records: Vec::new(),
             carry: Vec::new(),
             truncated: false,
             truncated_lines: 0,
@@ -52,8 +35,37 @@ impl LineSplitter {
     }
 
     pub fn feed(&mut self, chunk: &[u8]) {
+        // 快路径：上一块没有残行、也没有进行中的截断时，整块拷贝一次。
+        if self.carry.is_empty() && !self.truncated && self.feed_complete(chunk) {
+            return;
+        }
+        self.feed_line_by_line(chunk);
+    }
+
+    /// 快路径：块内记录都不超长时，整块一次性拷贝；末尾半行收进 carry。
+    /// 返回 `false` 表示需要走逐行路径（有超长行或末尾半行放不下）。
+    fn feed_complete(&mut self, chunk: &[u8]) -> bool {
+        let mut start = 0;
+        for i in memchr_iter(b'\n', chunk) {
+            if i + 1 - start > self.max_record {
+                return false;
+            }
+            start = i + 1;
+        }
+        // 末尾没有换行符的半行先收进 carry；放不下说明要截断，交给逐行路径。
+        let tail = &chunk[start..];
+        if tail.len() > self.max_record - 1 {
+            return false;
+        }
+        self.payload.extend_from_slice(&chunk[..start]);
+        self.carry.extend_from_slice(tail);
+        true
+    }
+
+    /// 逐行路径：处理跨块残行与超长行截断。
+    fn feed_line_by_line(&mut self, chunk: &[u8]) {
         let mut last = 0;
-        for i in memchr::memchr_iter(b'\n', chunk) {
+        for i in memchr_iter(b'\n', chunk) {
             self.push_carry(&chunk[last..i]);
             self.end_record();
             last = i + 1;
@@ -86,13 +98,8 @@ impl LineSplitter {
 
     /// 收尾当前行：carry + `\n` 组成一条完整记录。
     fn end_record(&mut self) {
-        let start = self.payload.len();
         self.payload.extend_from_slice(&self.carry);
         self.payload.push(b'\n');
-        self.records.push(Record {
-            start,
-            len: self.payload.len() - start,
-        });
         self.carry.clear();
         if self.truncated {
             self.truncated_lines += 1;
@@ -102,22 +109,15 @@ impl LineSplitter {
 
     /// 取走已经成形的记录。`final_chunk` 表示输入已结束：把没有换行符的最后一行
     /// 补上 `\n` 一起取走；否则未结束的半行留在内部等下一块数据。
-    pub fn take(&mut self, final_chunk: bool) -> Batch {
+    pub fn take(&mut self, final_chunk: bool) -> Vec<u8> {
         if final_chunk {
             self.finish();
         }
-        Batch {
-            payload: std::mem::take(&mut self.payload),
-            records: std::mem::take(&mut self.records),
-        }
+        std::mem::take(&mut self.payload)
     }
 
     pub fn payload_len(&self) -> usize {
         self.payload.len()
-    }
-
-    pub fn records_len(&self) -> usize {
-        self.records.len()
     }
 
     pub fn truncated_lines(&self) -> u64 {
@@ -141,11 +141,10 @@ mod tests {
     fn split_all(capacity: u64, input: &[u8]) -> Vec<Vec<u8>> {
         let mut splitter = LineSplitter::new(capacity);
         splitter.feed(input);
-        let batch = splitter.take(true);
-        batch
-            .records
-            .iter()
-            .map(|r| batch.payload[r.start..r.start + r.len].to_vec())
+        splitter
+            .take(true)
+            .split_inclusive(|&b| b == b'\n')
+            .map(<[u8]>::to_vec)
             .collect()
     }
 
@@ -169,12 +168,16 @@ mod tests {
         splitter.feed(b"hel");
         splitter.feed(b"lo\nwor");
         splitter.feed(b"ld\n");
-        let batch = splitter.take(false);
-        assert_eq!(batch.payload, b"hello\nworld\n".to_vec());
-        assert_eq!(
-            batch.records,
-            vec![Record { start: 0, len: 6 }, Record { start: 6, len: 6 }]
-        );
+        assert_eq!(splitter.take(false), b"hello\nworld\n".to_vec());
+    }
+
+    #[test]
+    fn carries_partial_line_across_chunks() {
+        let mut splitter = LineSplitter::new(4096);
+        splitter.feed(b"done\npar");
+        assert_eq!(splitter.take(false), b"done\n".to_vec());
+        splitter.feed(b"tial\n");
+        assert_eq!(splitter.take(false), b"partial\n".to_vec());
     }
 
     #[test]
@@ -188,23 +191,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_yields_empty_batch() {
-        let mut splitter = LineSplitter::new(4096);
-        assert!(splitter.take(true).is_empty());
+    fn truncation_across_chunks_is_counted_once() {
+        let mut splitter = LineSplitter::new(8);
+        splitter.feed(b"0123456");
+        splitter.feed(b"789\n");
+        assert_eq!(splitter.take(false), b"0123456\n".to_vec());
+        assert_eq!(splitter.take_truncated_lines(), 1);
+    }
+
+    #[test]
+    fn line_exactly_max_record_is_kept() {
+        let mut splitter = LineSplitter::new(8);
+        splitter.feed(b"0123456\n");
+        assert_eq!(splitter.take(false), b"0123456\n".to_vec());
+        assert_eq!(splitter.truncated_lines(), 0);
     }
 
     #[test]
     fn non_final_take_keeps_partial_line() {
         let mut splitter = LineSplitter::new(4096);
         splitter.feed(b"done\npar");
-        // 只取走已换行结束的完整记录，半行留在内部。
-        let batch = splitter.take(false);
-        assert_eq!(batch.payload, b"done\n".to_vec());
-        assert_eq!(batch.records, vec![Record { start: 0, len: 5 }]);
-        // 输入结束时补上换行，半行才成为记录。
-        let batch = splitter.take(true);
-        assert_eq!(batch.payload, b"par\n".to_vec());
-        assert_eq!(batch.records, vec![Record { start: 0, len: 4 }]);
+        assert_eq!(splitter.take(false), b"done\n".to_vec());
+        assert_eq!(splitter.take(true), b"par\n".to_vec());
+    }
+
+    #[test]
+    fn empty_input_yields_empty_payload() {
+        let mut splitter = LineSplitter::new(4096);
+        assert!(splitter.take(true).is_empty());
     }
 
     #[test]
