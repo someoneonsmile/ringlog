@@ -7,7 +7,7 @@
 //! 数据区是真正的环形：空间不足时用换行填充到文件尾，再从 0 继续写，
 //! 因此任何时刻数据区里都是一串以 `\n` 结尾的完整记录。
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -70,107 +70,145 @@ pub struct Ring {
     _writer_lock: File,
 }
 
+/// 续写已有文件时需要恢复的写入状态。
+struct State {
+    capacity: u64,
+    write_pos: u64,
+    total_written: u64,
+    seq: u64,
+    epoch: u64,
+}
+
+/// 取得写者独占锁；同一文件已有写者时返回用法错误。
+fn acquire_writer_lock(path: &Path) -> io::Result<File> {
+    let lock_file = lock_path(path);
+    let writer_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_file)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("无法创建锁文件 {}: {e}", lock_file.display()),
+            )
+        })?;
+    match writer_lock.try_lock() {
+        Ok(()) => Ok(writer_lock),
+        Err(TryLockError::WouldBlock) => Err(usage(format!(
+            "{} 正被另一个写入进程使用（锁文件：{}）",
+            path.display(),
+            lock_file.display()
+        ))),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+fn open_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("无法打开 {}: {e}", path.display())))
+}
+
+/// 初始化（或 `--force` 重建）文件，返回从零开始的写入状态。
+fn initialize(
+    file: &File,
+    total_size: u64,
+    existing: Option<Header>,
+    sync: bool,
+) -> io::Result<State> {
+    let capacity = data_capacity(total_size).ok_or_else(|| {
+        usage(format!(
+            "文件总大小至少需要 {MIN_TOTAL_SIZE} 字节（4 KiB 头区 + {MIN_DATA_CAPACITY} 字节数据区），当前 -s 为 {total_size} 字节"
+        ))
+    })?;
+    file.set_len(total_size)?;
+    let seq = existing.map_or(1, |h| h.seq.wrapping_add(1));
+    let epoch = existing.map_or(1, |h| h.epoch.wrapping_add(1).max(1));
+    write_slot(file, &Header::new(seq, epoch, capacity))?;
+    if sync {
+        file.sync_data()?;
+    }
+    Ok(State {
+        capacity,
+        write_pos: 0,
+        total_written: 0,
+        seq,
+        epoch,
+    })
+}
+
+/// 校验已有文件并恢复续写状态。
+fn resume(
+    file: &File,
+    path: &Path,
+    total_size: u64,
+    existing: Option<Header>,
+) -> io::Result<State> {
+    let len = file.metadata()?.len();
+    let capacity = data_capacity(len).ok_or_else(|| {
+        invalid(format!(
+            "{} 只有 {} 字节，不是有效的 ringlog 文件",
+            path.display(),
+            len
+        ))
+    })?;
+    if total_size != len {
+        return Err(usage(format!(
+            "{} 现有大小 {} 字节，与 -s {} 不一致；确认要重建请加 --force",
+            path.display(),
+            len,
+            total_size
+        )));
+    }
+    let header = existing.ok_or_else(|| {
+        invalid(format!(
+            "{} 的文件头无效（不是 ringlog 文件或已损坏）；确认覆盖请加 --force",
+            path.display()
+        ))
+    })?;
+    if header.capacity != capacity {
+        return Err(invalid(format!(
+            "{} 头区记录的容量 {} 与实际数据区 {} 不一致；确认重建请加 --force",
+            path.display(),
+            header.capacity,
+            capacity
+        )));
+    }
+    Ok(State {
+        capacity,
+        write_pos: header.write_pos,
+        total_written: header.total_written,
+        seq: header.seq,
+        epoch: header.epoch,
+    })
+}
+
 impl Ring {
     /// 打开或创建环形文件。
     ///
     /// `total_size` 是文件总大小（含 4 KiB 头区）；`force` 会丢弃已有数据并重建。
     pub fn open(path: &Path, total_size: u64, force: bool, sync: bool) -> io::Result<Self> {
-        let lock_file = lock_path(path);
-        let writer_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_file)
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("无法创建锁文件 {}: {e}", lock_file.display()),
-                )
-            })?;
-        match writer_lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(usage(format!(
-                    "{} 正被另一个写入进程使用（锁文件：{}）",
-                    path.display(),
-                    lock_file.display()
-                )));
-            }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
-        }
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| io::Error::new(e.kind(), format!("无法打开 {}: {e}", path.display())))?;
-        let len = file.metadata()?.len();
+        let writer_lock = acquire_writer_lock(path)?;
+        let file = open_file(path)?;
         let existing = read_header(&file)?;
-
-        let (capacity, write_pos, total_written, seq, epoch) = if force || len == 0 {
-            let capacity = data_capacity(total_size).ok_or_else(|| {
-                usage(format!(
-                    "文件总大小至少需要 {MIN_TOTAL_SIZE} 字节（4 KiB 头区 + {MIN_DATA_CAPACITY} 字节数据区），当前 -s 为 {total_size} 字节"
-                ))
-            })?;
-            file.set_len(total_size)?;
-            let seq = existing.map_or(1, |h| h.seq.wrapping_add(1));
-            let epoch = existing.map_or(1, |h| h.epoch.wrapping_add(1).max(1));
-            let header = Header::new(seq, epoch, capacity);
-            write_slot(&file, &header)?;
-            if sync {
-                file.sync_data()?;
-            }
-            (capacity, 0, 0, seq, epoch)
+        let state = if force || file.metadata()?.len() == 0 {
+            initialize(&file, total_size, existing, sync)?
         } else {
-            let capacity = data_capacity(len).ok_or_else(|| {
-                invalid(format!(
-                    "{} 只有 {} 字节，不是有效的 ringlog 文件",
-                    path.display(),
-                    len
-                ))
-            })?;
-            if total_size != len {
-                return Err(usage(format!(
-                    "{} 现有大小 {} 字节，与 -s {} 不一致；确认要重建请加 --force",
-                    path.display(),
-                    len,
-                    total_size
-                )));
-            }
-            let header = existing.ok_or_else(|| {
-                invalid(format!(
-                    "{} 的文件头无效（不是 ringlog 文件或已损坏）；确认覆盖请加 --force",
-                    path.display()
-                ))
-            })?;
-            if header.capacity != capacity {
-                return Err(invalid(format!(
-                    "{} 头区记录的容量 {} 与实际数据区 {} 不一致；确认重建请加 --force",
-                    path.display(),
-                    header.capacity,
-                    capacity
-                )));
-            }
-            (
-                capacity,
-                header.write_pos,
-                header.total_written,
-                header.seq,
-                header.epoch,
-            )
+            resume(&file, path, total_size, existing)?
         };
-
         Ok(Self {
             file,
-            capacity,
-            write_pos,
-            total_written,
-            seq,
-            epoch,
+            capacity: state.capacity,
+            write_pos: state.write_pos,
+            total_written: state.total_written,
+            seq: state.seq,
+            epoch: state.epoch,
             sync,
             _writer_lock: writer_lock,
         })

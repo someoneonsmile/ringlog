@@ -4,52 +4,17 @@
 //! EPIPE、并发压测、`--force` 重置、异常文件与参数错误。
 //! 所有子进程都有超时或 Drop 清理，任何一条测试失败都不会把测试进程挂死。
 
+mod common;
+
+use common::{TestDir, bin, path_text};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new() -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "ringlog-adv-{}-{id}-{:?}",
-            std::process::id(),
-            thread::current().id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn file(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ringlog"))
-}
-
-fn path_text(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
 
 fn lock_path(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_owned();
@@ -559,7 +524,7 @@ fn file_len(file: &Path) -> u64 {
 
 #[test]
 fn tiny_ring_capacity_boundary_records() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
 
     // 恰好 4096 字节（4095 内容 + 换行）：占满整个数据区。
     let file = dir.file("exact.ring");
@@ -598,7 +563,7 @@ fn tiny_ring_capacity_boundary_records() {
 
 #[test]
 fn tiny_ring_mixed_wrap_stays_consistent() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("mixed.ring");
 
     for round in 0..4u32 {
@@ -654,7 +619,7 @@ fn tiny_ring_mixed_wrap_stays_consistent() {
 
 #[test]
 fn tail_n_boundaries() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("tail.ring");
 
     // 已初始化但没有任何记录。
@@ -684,7 +649,7 @@ fn tail_n_boundaries() {
 
 #[test]
 fn tail_n_u64_max_does_not_panic() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("maxn.ring");
     assert_eq!(write_stdin(&file, "8K", b"a\nb\n").code(), Some(0));
 
@@ -699,7 +664,7 @@ fn tail_n_u64_max_does_not_panic() {
 /// `-f -n 0` 只输出启动之后的新数据，历史记录一行都不能出现。
 #[test]
 fn follow_n_zero_emits_only_new_data() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("onlynew.ring");
     assert_eq!(
         write_stdin(&file, "8K", b"old 1\nold 2\nold 3\n").code(),
@@ -727,7 +692,7 @@ fn follow_n_zero_emits_only_new_data() {
 // 唯一一条完整记录。`-n 1` 的语义是“最后 1 行”。
 #[test]
 fn single_full_record_window_is_visible() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("single.ring");
 
     let mut first = vec![b'A'; 4095];
@@ -761,7 +726,7 @@ fn single_full_record_window_is_visible() {
 // 窗口里正好有 3 条记录、且窗口起点对齐时，`-n 3` 应输出 3 行（不是 2 行）。
 #[test]
 fn tail_n_larger_than_available_on_aligned_window() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("aligned3.ring");
 
     let mut filler = vec![b'A'; 4095];
@@ -805,7 +770,7 @@ fn tail_n_larger_than_available_on_aligned_window() {
 
 #[test]
 fn corrupt_latest_slot_falls_back_to_previous() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("fallback.ring");
 
     // 8500 条 7 字节记录，按 4096 / 4096 / 308 分批：
@@ -859,7 +824,7 @@ fn corrupt_latest_slot_falls_back_to_previous() {
 
 #[test]
 fn both_slots_corrupt_require_force() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("both.ring");
     assert_eq!(write_stdin(&file, "8K", b"seed\n").code(), Some(0));
     let before = fs::read(&file).unwrap();
@@ -898,7 +863,7 @@ fn both_slots_corrupt_require_force() {
 
 #[test]
 fn inconsistent_header_invariant_is_rejected() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("invariant.ring");
     assert_eq!(write_stdin(&file, "8K", b"AAAA\n").code(), Some(0));
 
@@ -951,7 +916,7 @@ fn inconsistent_header_invariant_is_rejected() {
 
 #[test]
 fn sigkill_restart_loop_keeps_ring_consistent() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("crash.ring");
     let size = 8192u64;
 
@@ -1023,7 +988,7 @@ fn sigkill_restart_loop_keeps_ring_consistent() {
 
 #[test]
 fn concurrent_writers_exclusive_lock() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("locked.ring");
 
     let mut first = GuardChild::spawn_writer(&file, "8K");
@@ -1057,7 +1022,7 @@ fn concurrent_writers_exclusive_lock() {
 /// 两个写者几乎同时启动：必须恰好一个拿到锁，另一个 exit 2。
 #[test]
 fn simultaneous_writers_race_one_wins() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("race.ring");
 
     let mut a = GuardChild::spawn_writer(&file, "8K");
@@ -1104,7 +1069,7 @@ fn simultaneous_writers_race_one_wins() {
 
 #[test]
 fn follow_epipe_exits_zero() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("epipe.ring");
 
     let mut history = String::new();
@@ -1145,7 +1110,7 @@ fn follow_epipe_exits_zero() {
 
 #[test]
 fn follow_concurrent_64m_ring_exact_output() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("live64m.ring");
     assert_eq!(write_stdin(&file, "64M", b"").code(), Some(0));
 
@@ -1178,7 +1143,7 @@ fn follow_concurrent_64m_ring_exact_output() {
 
 #[test]
 fn follow_concurrent_8k_wrap_only_complete_lines() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("stress8k.ring");
     assert_eq!(write_stdin(&file, "8K", b"").code(), Some(0));
 
@@ -1244,7 +1209,7 @@ fn follow_concurrent_8k_wrap_only_complete_lines() {
 
 #[test]
 fn follow_detects_force_reset_same_size() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("reset.ring");
     assert_eq!(
         write_stdin(&file, "8K", b"old1\nold2\nold3\n").code(),
@@ -1284,7 +1249,7 @@ fn follow_detects_force_reset_same_size() {
 
 #[test]
 fn follow_handles_force_resize_as_documented() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("resize.ring");
     assert_eq!(write_stdin(&file, "8K", b"old\n").code(), Some(0));
 
@@ -1328,7 +1293,7 @@ fn follow_handles_force_resize_as_documented() {
 
 #[test]
 fn reader_rejects_uninitialized_and_truncated_files() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
 
     // 0 字节文件：reader 必须给出清晰错误，而不是 panic 或挂死。
     let empty = dir.file("zero.ring");
@@ -1391,7 +1356,7 @@ fn reader_rejects_uninitialized_and_truncated_files() {
 
 #[test]
 fn usage_errors_exit_two() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("adv");
     let file = dir.file("args.ring");
     let p = path_text(&file);
 

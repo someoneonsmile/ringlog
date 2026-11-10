@@ -1,45 +1,14 @@
 //! 黑盒集成测试：直接运行 ringlog 二进制，验证对外行为。
 
+mod common;
+
+use common::{TestDir, bin, path_text};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new() -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("ringlog-it-{}-{id}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn file(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_ringlog"))
-}
-
-fn path_text(path: &Path) -> &str {
-    path.to_str().unwrap()
-}
 
 fn parse_size(text: &str) -> u64 {
     let (num, suffix) = text.split_at(text.len() - 1);
@@ -141,7 +110,7 @@ impl Follower {
 
 #[test]
 fn write_then_dump_roundtrip() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("app.ring");
     let mut input = String::new();
     for i in 0..100 {
@@ -155,7 +124,7 @@ fn write_then_dump_roundtrip() {
 
 #[test]
 fn file_size_never_grows() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("fixed.ring");
     let size = "8K";
     let input: String = (0..2000).map(|i| format!("row {i}\n")).collect();
@@ -172,7 +141,7 @@ fn file_size_never_grows() {
 
 #[test]
 fn wrap_keeps_recent_complete_lines() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("wrap.ring");
     let input: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
     assert!(write_stdin(&file, "8K", input.as_bytes()).status.success());
@@ -195,7 +164,7 @@ fn wrap_keeps_recent_complete_lines() {
 
 #[test]
 fn tail_n_returns_exact_last_lines() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("tail.ring");
     let input: String = (1..=20).map(|i| format!("line {i}\n")).collect();
     assert!(write_stdin(&file, "64K", input.as_bytes()).status.success());
@@ -210,7 +179,7 @@ fn tail_n_returns_exact_last_lines() {
 
 #[test]
 fn tail_more_than_available() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("tailall.ring");
     let input = "a\nb\n";
     assert!(write_stdin(&file, "64K", input.as_bytes()).status.success());
@@ -221,7 +190,7 @@ fn tail_more_than_available() {
 
 #[test]
 fn appends_missing_trailing_newline() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("nonl.ring");
     assert!(write_stdin(&file, "8K", b"abc").status.success());
     assert_eq!(dump(&file), b"abc\n");
@@ -229,7 +198,7 @@ fn appends_missing_trailing_newline() {
 
 #[test]
 fn keeps_blank_lines_and_binary_bytes() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("bin.ring");
     let input: &[u8] = b"a\n\nb\n\x00\xff\xfe\n";
     assert!(write_stdin(&file, "8K", input).status.success());
@@ -238,7 +207,7 @@ fn keeps_blank_lines_and_binary_bytes() {
 
 #[test]
 fn overlong_line_is_truncated_and_warned() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("long.ring");
     let input = format!("{}\n", "A".repeat(10_000));
     let out = write_stdin(&file, "8K", input.as_bytes());
@@ -254,7 +223,7 @@ fn overlong_line_is_truncated_and_warned() {
 
 #[test]
 fn empty_input_creates_empty_ring() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("empty.ring");
     assert!(write_stdin(&file, "8K", b"").status.success());
     assert!(dump(&file).is_empty());
@@ -267,7 +236,7 @@ fn empty_input_creates_empty_ring() {
 
 #[test]
 fn second_writer_is_rejected() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("locked.ring");
     let mut first = bin()
         .args(["-s", "8K"])
@@ -295,7 +264,7 @@ fn second_writer_is_rejected() {
 
 #[test]
 fn size_mismatch_needs_force() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("mismatch.ring");
     assert!(write_stdin(&file, "16K", b"old\n").status.success());
 
@@ -317,7 +286,7 @@ fn size_mismatch_needs_force() {
 
 #[test]
 fn rejects_foreign_file() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("junk.bin");
     fs::write(&file, vec![0xABu8; 20 * 1024]).unwrap();
 
@@ -331,7 +300,7 @@ fn rejects_foreign_file() {
 
 #[test]
 fn follow_outputs_new_data() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("live.ring");
     assert!(
         write_stdin(&file, "64K", b"old 1\nold 2\n")
@@ -355,7 +324,7 @@ fn follow_outputs_new_data() {
 
 #[test]
 fn follow_starts_with_last_lines() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("hist.ring");
     assert!(
         write_stdin(&file, "64K", b"a\nb\nc\nd\ne\n")
@@ -375,7 +344,7 @@ fn follow_starts_with_last_lines() {
 
 #[test]
 fn slow_reader_warns_and_skips_old_data() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("slow.ring");
     assert!(write_stdin(&file, "8K", b"").status.success());
 
@@ -411,7 +380,7 @@ fn slow_reader_warns_and_skips_old_data() {
 
 #[test]
 fn crash_mid_stream_then_restart() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("crash.ring");
     let mut child = bin()
         .args(["-s", "64K"])
@@ -465,7 +434,7 @@ fn usage_errors_exit_2() {
 
 #[test]
 fn reader_rejects_uninitialized_file() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("zero.ring");
     fs::write(&file, b"").unwrap();
     let out = run(&["-f", path_text(&file)]);
@@ -475,7 +444,7 @@ fn reader_rejects_uninitialized_file() {
 
 #[test]
 fn broken_pipe_makes_follower_exit_zero() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("pipe.ring");
     assert!(write_stdin(&file, "8K", b"").status.success());
 
@@ -498,7 +467,7 @@ fn broken_pipe_makes_follower_exit_zero() {
 
 #[test]
 fn concurrent_reader_never_outputs_torn_lines() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("torn.ring");
     assert!(write_stdin(&file, "8K", b"").status.success());
 
@@ -527,7 +496,7 @@ fn concurrent_reader_never_outputs_torn_lines() {
 
 #[test]
 fn force_reset_is_noticed_by_follower() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("reset.ring");
     assert!(write_stdin(&file, "8K", b"a\nb\nc\n").status.success());
 
@@ -552,7 +521,7 @@ fn force_reset_is_noticed_by_follower() {
 
 #[test]
 fn newest_header_slot_corruption_falls_back() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("slot.ring");
     assert!(write_stdin(&file, "8K", b"a\nb\nc\n").status.success());
 
@@ -578,7 +547,7 @@ fn newest_header_slot_corruption_falls_back() {
 
 #[test]
 fn closed_stderr_does_not_crash_writer() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("nostderr.ring");
     let mut child = bin()
         .args(["-s", "8K"])
@@ -599,7 +568,7 @@ fn closed_stderr_does_not_crash_writer() {
 
 #[test]
 fn force_reset_with_larger_total_is_detected() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("reset2.ring");
     assert!(write_stdin(&file, "8K", b"old\n").status.success());
 
@@ -636,7 +605,7 @@ fn force_reset_with_larger_total_is_detected() {
 
 #[test]
 fn writer_flushes_low_rate_input_promptly() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("prompt.ring");
     let mut writer = bin()
         .args(["-s", "64K"])
@@ -664,7 +633,7 @@ fn writer_flushes_low_rate_input_promptly() {
 
 #[test]
 fn writer_flushes_steady_low_rate_input() {
-    let dir = TestDir::new();
+    let dir = TestDir::new("it");
     let file = dir.file("steady.ring");
     let mut writer = bin()
         .args(["-s", "64K"])
