@@ -12,6 +12,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
+use crate::error::{invalid, usage};
 use crate::format::{
     DATA_OFFSET, HEADER_PAGE, Header, MIN_DATA_CAPACITY, MIN_TOTAL_SIZE, SLOT_BYTES, SLOT_OFFSETS,
     data_capacity, file_size,
@@ -21,14 +22,6 @@ use crate::input::Batch;
 /// 环绕填充每次写入的块大小。
 const PAD_CHUNK: usize = 64 * 1024;
 static PAD_BYTES: [u8; PAD_CHUNK] = [b'\n'; PAD_CHUNK];
-
-fn invalid(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.into())
-}
-
-fn usage(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, msg.into())
-}
 
 /// 写者互斥锁文件的路径：`<FILE>.lock`。
 pub fn lock_path(path: &Path) -> PathBuf {

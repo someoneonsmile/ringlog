@@ -1,16 +1,17 @@
 //! ringlog 命令行入口：解析参数、分派模式、决定退出码。
 
+#![deny(unsafe_code)]
+
 mod app;
 
 use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-use ringlog::cli::{self, Cli, Mode};
-use ringlog::follow;
 use ringlog::ring::Reader;
 
-use app::{info, report, writer};
+use app::cli::{self, Cli, Mode};
+use app::{follow, info, report, writer};
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -29,9 +30,10 @@ fn main() -> ExitCode {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             report::warn(format_args!("{e}"));
-            match e.kind() {
-                io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ExitCode::from(2),
-                _ => ExitCode::from(1),
+            if ringlog::error::is_user_error(e.kind()) {
+                ExitCode::from(2)
+            } else {
+                ExitCode::from(1)
             }
         }
     }

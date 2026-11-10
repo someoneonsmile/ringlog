@@ -1,4 +1,4 @@
-//! 读取与跟随（`-f`）。
+//! 读取与跟随（`-f` / `-n`）。
 //!
 //! 每次 `step` 在 [`Reader::with_snapshot`] 的共享锁内只做两件事：读头部、把一个
 //! chunk 的数据拷到内存。锁释放之后才写 stdout，所以下游管道变慢也不会阻塞写者。
@@ -10,11 +10,13 @@
 //!   从下一个换行符开始继续，丢弃可能不完整的记录；
 //! - 文件被 `--force` 重建（头部的 `epoch` 变化）时告警并重新定位。
 
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use crate::ring::Reader;
-use crate::seek::{StartPos, locate_start, scan_to_next_line};
+use ringlog::ring::Reader;
+use ringlog::seek::{StartPos, locate_start, scan_to_next_line};
+
+use super::report;
 
 /// 每次加锁最多搬运的字节数。
 const CHUNK: usize = 64 * 1024;
@@ -23,12 +25,7 @@ const WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 按 `start` 决定首屏起点，`follow` 为真时持续输出新数据。
 pub fn run(reader: &Reader, follow: bool, start: StartPos, interval: Duration) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut tailer = Tailer::new(
-        reader,
-        BufWriter::with_capacity(CHUNK, stdout.lock()),
-        start,
-    );
+    let mut tailer = Tailer::new(reader, report::buffered_stdout(), start);
     tailer.init()?;
 
     if !follow {
@@ -66,7 +63,9 @@ struct Tailer<'a, W: Write> {
 
 #[derive(Clone, Copy)]
 enum Warning {
+    /// 落后超过一整个数据区：`bytes` 为累计丢失量。
     Lost(u64),
+    /// 文件被重新初始化。
     Reset,
 }
 
@@ -85,10 +84,13 @@ impl<'a, W: Write> Tailer<'a, W> {
     }
 
     fn init(&mut self) -> io::Result<()> {
-        let (consumed, epoch) = self
+        let (located, epoch) = self
             .reader
             .with_snapshot(|r, h| Ok((locate_start(r, h, self.start)?, h.epoch)))?;
-        self.consumed = consumed;
+        if located.no_newline {
+            warn_no_newline(located.dropped);
+        }
+        self.consumed = located.pos;
         self.epoch = epoch;
         Ok(())
     }
@@ -104,38 +106,46 @@ impl<'a, W: Write> Tailer<'a, W> {
         let start = self.consumed;
         let expected_epoch = self.epoch;
         let mut buf = vec![0u8; CHUNK];
-        let (consumed, read_len, warning, new_epoch) = self.reader.with_snapshot(|r, h| {
-            let end = h.total_written;
-            // 纪元变化说明文件被 --force 重建；total_written 回退是兜底判断。
-            if h.epoch != expected_epoch || end < start {
-                // 重建后的内容都算“新数据”，从头输出有效部分。
-                let consumed = locate_start(r, h, StartPos::Oldest)?;
-                return Ok((consumed, 0, Some(Warning::Reset), Some(h.epoch)));
-            }
-            let mut available = end - start;
-            let mut consumed = start;
-            let mut warning = None;
-            if available > h.capacity {
-                // 落后超过整个环形窗口：旧数据已被覆盖。
-                let oldest = end - h.capacity;
-                let lost = available - h.capacity;
-                consumed = if oldest.is_multiple_of(h.capacity) {
-                    oldest
-                } else {
-                    scan_to_next_line(r, oldest, end)?
-                };
-                available = end - consumed;
-                warning = Some(Warning::Lost(lost));
-            }
-            if available == 0 {
-                return Ok((consumed, 0, warning, None));
-            }
-            let n = available.min(CHUNK as u64) as usize;
-            r.read_exact_abs(consumed, &mut buf[..n])?;
-            Ok((consumed, n, warning, None))
-        })?;
+        let (consumed, read_len, warning, new_epoch, dropped_no_newline) =
+            self.reader.with_snapshot(|r, h| {
+                let end = h.total_written;
+                // 纪元变化说明文件被 --force 重建；total_written 回退是兜底判断。
+                if h.epoch != expected_epoch || end < start {
+                    // 重建后的内容都算“新数据”，从头输出有效部分。
+                    let located = locate_start(r, h, StartPos::Oldest)?;
+                    let dropped = located.no_newline.then_some(located.dropped);
+                    return Ok((located.pos, 0, Some(Warning::Reset), Some(h.epoch), dropped));
+                }
+                let mut available = end - start;
+                let mut consumed = start;
+                let mut warning = None;
+                let mut dropped = None;
+                if available > h.capacity {
+                    // 落后超过整个环形窗口：旧数据已被覆盖。
+                    let oldest = end - h.capacity;
+                    let lost = available - h.capacity;
+                    consumed = if oldest.is_multiple_of(h.capacity) {
+                        oldest
+                    } else {
+                        let located = scan_to_next_line(r, oldest, end)?;
+                        dropped = located.no_newline.then_some(located.dropped);
+                        located.pos
+                    };
+                    available = end - consumed;
+                    warning = Some(Warning::Lost(lost));
+                }
+                if available == 0 {
+                    return Ok((consumed, 0, warning, None, dropped));
+                }
+                let n = available.min(CHUNK as u64) as usize;
+                r.read_exact_abs(consumed, &mut buf[..n])?;
+                Ok((consumed, n, warning, None, dropped))
+            })?;
         if let Some(epoch) = new_epoch {
             self.epoch = epoch;
+        }
+        if let Some(dropped) = dropped_no_newline {
+            warn_no_newline(dropped);
         }
 
         match warning {
@@ -143,7 +153,7 @@ impl<'a, W: Write> Tailer<'a, W> {
                 self.lost_bytes += bytes;
                 let due = self.last_warn.is_none_or(|t| t.elapsed() >= WARN_INTERVAL);
                 if due {
-                    crate::warn(format_args!(
+                    report::warn(format_args!(
                         "警告：跟读落后，累计约 {} 字节旧数据已被覆盖，跳到最旧数据继续",
                         self.lost_bytes
                     ));
@@ -152,7 +162,7 @@ impl<'a, W: Write> Tailer<'a, W> {
                 }
             }
             Some(Warning::Reset) => {
-                crate::warn("警告：文件已被重新初始化，从当前有效数据继续");
+                report::warn("警告：文件已被重新初始化，从当前有效数据继续");
                 self.pending.clear();
                 self.consumed = consumed;
                 return Ok(true);
@@ -176,7 +186,7 @@ impl<'a, W: Write> Tailer<'a, W> {
         }
         // 正常数据里单条记录不会超过数据区容量；超过说明数据异常，避免内存无限增长。
         if self.pending.len() as u64 > self.reader.capacity() {
-            crate::warn(format_args!(
+            report::warn(format_args!(
                 "警告：{} 字节数据中没有换行符，丢弃",
                 self.pending.len()
             ));
@@ -184,4 +194,10 @@ impl<'a, W: Write> Tailer<'a, W> {
         }
         Ok(())
     }
+}
+
+fn warn_no_newline(dropped: u64) {
+    report::warn(format_args!(
+        "警告：可读数据中没有换行符，丢弃 {dropped} 字节"
+    ));
 }

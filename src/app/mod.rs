@@ -2,6 +2,8 @@
 //!
 //! 引擎（文件格式、环形读写、定位）在 `ringlog` 库里；这里只做 I/O 与用户交互。
 
+pub mod cli;
+pub mod follow;
 pub mod info;
 pub mod report;
 pub mod writer;

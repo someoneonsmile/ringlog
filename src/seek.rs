@@ -4,6 +4,8 @@
 //! - 窗口起点（`total_written - capacity`）可能落在一条记录中间。它前一个字节已被
 //!   新数据覆盖，无法判断是否对齐，所以整条丢弃、从下一个换行符之后开始；
 //! - 窗口起点恰好落在物理偏移 0（即记录边界）时不能丢第一条记录。
+//!
+//! 这里只报告「起点和丢了什么」，不打印任何东西——是否告警由调用方决定。
 
 use std::io;
 
@@ -24,25 +26,46 @@ pub enum StartPos {
     Last(u64),
 }
 
+/// 窗口定位结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Located {
+    /// 记录起点的逻辑偏移。
+    pub pos: u64,
+    /// 为对齐记录边界而丢弃的字节数（正常数据下最多一条记录）。
+    pub dropped: u64,
+    /// 窗口内没有任何换行符（数据异常），此时 `dropped` 是全部可读数据。
+    pub no_newline: bool,
+}
+
+impl Located {
+    fn at(pos: u64) -> Self {
+        Self {
+            pos,
+            dropped: 0,
+            no_newline: false,
+        }
+    }
+}
+
 /// 计算首屏起点（逻辑偏移 = 累计写入字节数）。
-pub fn locate_start(reader: &Reader, header: &Header, start: StartPos) -> io::Result<u64> {
+pub fn locate_start(reader: &Reader, header: &Header, start: StartPos) -> io::Result<Located> {
     let end = header.total_written;
     let oldest = end.saturating_sub(header.capacity);
     let aligned = oldest.is_multiple_of(header.capacity);
     match start {
         StartPos::Oldest => {
             if aligned {
-                Ok(oldest)
+                Ok(Located::at(oldest))
             } else {
                 scan_to_next_line(reader, oldest, end)
             }
         }
-        StartPos::Newest => Ok(end),
+        StartPos::Newest => Ok(Located::at(end)),
         StartPos::Last(n) => match scan_back(reader, end, oldest, n)? {
             // scan_back 返回的是换行符之后的位置，天然对齐，直接使用。
-            Some(start) => Ok(start),
+            Some(pos) => Ok(Located::at(pos)),
             // 窗口内不足 n 行：从最旧数据开始，但起点可能落在半条记录上。
-            None if aligned => Ok(oldest),
+            None if aligned => Ok(Located::at(oldest)),
             None => scan_to_next_line(reader, oldest, end),
         },
     }
@@ -53,9 +76,9 @@ pub fn locate_start(reader: &Reader, header: &Header, start: StartPos) -> io::Re
 /// 环形窗口的起点（`total_written - capacity`）可能落在一条记录中间，
 /// 而且它前一个字节已被新数据覆盖，无法据此判断是否对齐，所以只能向前扫到换行符。
 /// 代价：接缝处最旧的一条记录可能被整体丢弃，但绝不会输出撕裂的半条记录。
-pub(crate) fn scan_to_next_line(reader: &Reader, from: u64, upto: u64) -> io::Result<u64> {
+pub fn scan_to_next_line(reader: &Reader, from: u64, upto: u64) -> io::Result<Located> {
     if from >= upto {
-        return Ok(from);
+        return Ok(Located::at(from));
     }
     let mut buf = vec![0u8; CHUNK];
     let mut abs = from;
@@ -63,16 +86,20 @@ pub(crate) fn scan_to_next_line(reader: &Reader, from: u64, upto: u64) -> io::Re
         let n = ((upto - abs) as usize).min(CHUNK);
         reader.read_exact_abs(abs, &mut buf[..n])?;
         if let Some(i) = memchr::memchr(b'\n', &buf[..n]) {
-            return Ok(abs + i as u64 + 1);
+            let pos = abs + i as u64 + 1;
+            return Ok(Located {
+                pos,
+                dropped: pos - from,
+                no_newline: false,
+            });
         }
         abs += n as u64;
     }
-    // 可读窗口内没有换行符（数据异常）：全部丢弃，避免输出乱码。
-    crate::warn(format_args!(
-        "警告：可读数据中没有换行符，丢弃 {} 字节",
-        upto - from
-    ));
-    Ok(upto)
+    Ok(Located {
+        pos: upto,
+        dropped: upto - from,
+        no_newline: true,
+    })
 }
 
 /// 从末尾向前数 `n + 1` 个换行符，返回最后一个换行符之后的位置（即最后 `n` 行的起点）；
@@ -139,7 +166,7 @@ mod tests {
         }
     }
 
-    fn start(reader: &Reader, pos: StartPos) -> u64 {
+    fn locate(reader: &Reader, pos: StartPos) -> Located {
         reader
             .with_snapshot(|r, h| locate_start(r, h, pos))
             .unwrap()
@@ -155,16 +182,16 @@ mod tests {
     #[test]
     fn oldest_without_wrap_is_zero() {
         let (_temp, reader) = TempRing::new(4096, b"a\nbb\nccc\n");
-        assert_eq!(start(&reader, StartPos::Oldest), 0);
-        assert_eq!(start(&reader, StartPos::Newest), 9);
-        assert_eq!(start(&reader, StartPos::Last(2)), 2);
-        assert_eq!(start(&reader, StartPos::Last(100)), 0);
+        assert_eq!(locate(&reader, StartPos::Oldest), Located::at(0));
+        assert_eq!(locate(&reader, StartPos::Newest), Located::at(9));
+        assert_eq!(locate(&reader, StartPos::Last(2)), Located::at(2));
+        assert_eq!(locate(&reader, StartPos::Last(100)), Located::at(0));
     }
 
     #[test]
     fn last_u64_max_means_all_data() {
         let (_temp, reader) = TempRing::new(4096, b"a\nbb\nccc\n");
-        assert_eq!(start(&reader, StartPos::Last(u64::MAX)), 0);
+        assert_eq!(locate(&reader, StartPos::Last(u64::MAX)), Located::at(0));
     }
 
     #[test]
@@ -173,9 +200,9 @@ mod tests {
         let mut data = full_record(4096, b'A');
         data.extend_from_slice(&full_record(4096, b'B'));
         let (_temp, reader) = TempRing::new(4096, &data);
-        assert_eq!(start(&reader, StartPos::Oldest), 4096);
-        assert_eq!(start(&reader, StartPos::Last(1)), 4096);
-        assert_eq!(start(&reader, StartPos::Newest), 8192);
+        assert_eq!(locate(&reader, StartPos::Oldest), Located::at(4096));
+        assert_eq!(locate(&reader, StartPos::Last(1)), Located::at(4096));
+        assert_eq!(locate(&reader, StartPos::Newest), Located::at(8192));
     }
 
     #[test]
@@ -187,11 +214,10 @@ mod tests {
             data.extend_from_slice(&full_record(4096, b'A'));
         }
         let (_temp, reader) = TempRing::new(131072, &data);
-        assert_eq!(start(&reader, StartPos::Last(20)), 180224);
+        assert_eq!(locate(&reader, StartPos::Last(20)), Located::at(180224));
         // 超过窗口内行数时回退到最旧数据（此处对齐，一条不丢）。
-        assert_eq!(start(&reader, StartPos::Last(40)), 131072);
-        // 窗口起点正好对齐记录边界：一条都不丢。
-        assert_eq!(start(&reader, StartPos::Oldest), 131072);
+        assert_eq!(locate(&reader, StartPos::Last(40)), Located::at(131072));
+        assert_eq!(locate(&reader, StartPos::Oldest), Located::at(131072));
     }
 
     #[test]
@@ -206,9 +232,16 @@ mod tests {
         data.push(b'\n');
 
         let (_temp, reader) = TempRing::new(4096, &data);
-        assert_eq!(start(&reader, StartPos::Oldest), 12288);
-        assert_eq!(start(&reader, StartPos::Last(1)), 12288);
-        assert_eq!(start(&reader, StartPos::Last(100)), 12288);
-        assert_eq!(start(&reader, StartPos::Newest), 13288);
+        assert_eq!(
+            locate(&reader, StartPos::Oldest),
+            Located {
+                pos: 12288,
+                dropped: 3096,
+                no_newline: false,
+            }
+        );
+        assert_eq!(locate(&reader, StartPos::Last(1)), Located::at(12288));
+        assert_eq!(locate(&reader, StartPos::Last(100)).pos, 12288);
+        assert_eq!(locate(&reader, StartPos::Newest), Located::at(13288));
     }
 }

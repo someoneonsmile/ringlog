@@ -11,8 +11,8 @@ use std::time::Duration;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
-use crate::format::MIN_TOTAL_SIZE;
-use crate::seek::StartPos;
+use ringlog::format::MIN_TOTAL_SIZE;
+use ringlog::seek::StartPos;
 
 const ABOUT: &str = "固定大小的单文件环形日志";
 
