@@ -80,7 +80,7 @@ jobs:
           # 复制二进制文件
           cp "target/${{ matrix.target }}/release/ringlog" "$staging/"
 
-          # 复制 build.rs 生成的 shell 补全（bash/zsh/fish/elvish/powershell）与 man 手册页
+          # 复制 build.rs 生成的 shell 补全（bash/zsh/fish/elvish）与 man 手册页
           cp -r "${SHELL_HELP_DIR}/complete" "$staging/"
           cp -r "${SHELL_HELP_DIR}/man" "$staging/"
 

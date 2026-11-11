@@ -1,7 +1,7 @@
 // 构建脚本：生成 shell 补全文件和 man 手册页。
 //
-// 只有设置了 SHELL_HELP_DIR 环境变量时才生成到 $SHELL_HELP_DIR/complete/
-// 与 $SHELL_HELP_DIR/man/；未设置时静默跳过（普通 cargo build 不在源码树里产生文件）。
+// 只有设置了非空的 SHELL_HELP_DIR 环境变量时才生成到 $SHELL_HELP_DIR/complete/
+// 与 $SHELL_HELP_DIR/man/；未设置或为空时静默跳过（普通 cargo build 不在源码树里产生文件）。
 include!("src/app/cli_types.rs");
 
 use std::env;
@@ -9,7 +9,6 @@ use std::error::Error;
 use std::fs::{File, create_dir_all};
 
 use clap::CommandFactory;
-use clap::ValueEnum;
 use clap_complete::{Shell, generate_to};
 use clap_mangen::Man;
 
@@ -21,7 +20,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 会命中缓存、不生成补全。
     println!("cargo:rerun-if-env-changed=SHELL_HELP_DIR");
 
-    let outdir = match env::var_os("SHELL_HELP_DIR") {
+    // 空值视为未设置：否则 `SHELL_HELP_DIR= cargo build` 会把相对路径解析到源码树根。
+    let outdir = match env::var_os("SHELL_HELP_DIR").filter(|value| !value.is_empty()) {
         None => return Ok(()),
         Some(outdir) => std::path::PathBuf::from(outdir),
     };
@@ -29,10 +29,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut cmd = Args::command();
     let bin_name = cmd.get_name().to_owned();
 
-    // 为所有支持的 shell 生成补全文件（bash/zsh/fish/elvish/powershell）
+    // 项目只支持 Unix，补全只生成 Unix 下常用的 shell，不生成 PowerShell。
+    let shells = [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::Elvish];
     let complete_dir = outdir.join("complete");
     create_dir_all(&complete_dir)?;
-    for &shell in Shell::value_variants() {
+    for shell in shells {
         generate_to(shell, &mut cmd, &bin_name, &complete_dir)?;
     }
 
