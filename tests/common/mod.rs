@@ -44,3 +44,9 @@ pub fn bin() -> Command {
 pub fn path_text(path: &Path) -> &str {
     path.to_str().unwrap()
 }
+
+/// 侧车锁文件路径：按目标文件的规范路径派生（与写者实现一致），
+/// 否则通过符号链接或带 `..`/`.` 的路径找不到写者实际持有的那把锁。
+pub fn lock_path(file: &Path) -> PathBuf {
+    ringlog::ring::lock_path(file).unwrap()
+}

@@ -2,9 +2,10 @@
 
 mod common;
 
-use common::{TestDir, bin, path_text};
+use common::{TestDir, bin, lock_path, path_text};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Child, Output, Stdio};
 use std::thread;
@@ -245,7 +246,7 @@ fn second_writer_is_rejected() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let lock = file.with_extension("ring.lock");
+    let lock = lock_path(&file);
     wait_until(|| lock.exists());
     // 稍等第一个写者拿到锁
     wait_until(|| std::fs::File::open(&lock).is_ok_and(|f| f.try_lock().is_err()));
@@ -260,6 +261,98 @@ fn second_writer_is_rejected() {
 
     let _ = first.kill();
     let _ = first.wait();
+}
+
+/// 同一文件用符号链接访问也是同一个文件：第二个写者必须被拒。
+#[test]
+fn second_writer_via_symlink_is_rejected() {
+    let dir = TestDir::new("it");
+    let real = dir.file("locked.ring");
+    let alias_dir = dir.file("alias");
+    fs::create_dir(&alias_dir).unwrap();
+    let alias = alias_dir.join("locked.ring");
+    symlink(&real, &alias).unwrap();
+
+    let mut first = bin()
+        .args(["-s", "8K"])
+        .arg(&real)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lock = lock_path(&real);
+    wait_until(|| lock.exists());
+    wait_until(|| std::fs::File::open(&lock).is_ok_and(|f| f.try_lock().is_err()));
+
+    let out = run(&["-s", "8K", path_text(&alias)]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("正被另一个写入进程使用"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
+/// 带 `.` 的等价路径同样归一到同一把锁。
+#[test]
+fn second_writer_via_dot_path_is_rejected() {
+    let dir = TestDir::new("it");
+    let file = dir.file("locked.ring");
+    let mut first = bin()
+        .args(["-s", "8K"])
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let lock = lock_path(&file);
+    wait_until(|| lock.exists());
+    wait_until(|| std::fs::File::open(&lock).is_ok_and(|f| f.try_lock().is_err()));
+
+    let alias = dir.file(".").join("locked.ring");
+    let out = run(&["-s", "8K", path_text(&alias)]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("正被另一个写入进程使用"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
+/// 通过符号链接启动写者时，锁必须落在真实文件旁，而不是符号链接所在目录。
+#[test]
+fn writer_lock_uses_canonical_path() {
+    let dir = TestDir::new("it");
+    let real = dir.file("real.ring");
+    let alias_dir = dir.file("alias");
+    fs::create_dir(&alias_dir).unwrap();
+    let alias = alias_dir.join("real.ring");
+    symlink(&real, &alias).unwrap();
+
+    let mut writer = bin()
+        .args(["-s", "8K"])
+        .arg(&alias)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let real_lock = lock_path(&real);
+    wait_until(|| real_lock.exists());
+    wait_until(|| std::fs::File::open(&real_lock).is_ok_and(|f| f.try_lock().is_err()));
+    assert!(real.exists(), "数据文件应落在符号链接指向的真实路径");
+    assert!(
+        !alias_dir.join("real.ring.lock").exists(),
+        "锁文件不应落在符号链接所在目录"
+    );
+
+    let _ = writer.kill();
+    let _ = writer.wait();
 }
 
 #[test]

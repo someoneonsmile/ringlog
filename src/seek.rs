@@ -161,8 +161,10 @@ mod tests {
 
     impl Drop for TempRing {
         fn drop(&mut self) {
+            if let Ok(lock) = crate::ring::lock_path(&self.path) {
+                let _ = std::fs::remove_file(lock);
+            }
             let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(crate::ring::lock_path(&self.path));
         }
     }
 

@@ -117,7 +117,7 @@ Reader::open（校验 文件大小 == file_size(capacity)）
 | 每条记录以 `\n` 结尾、长度 ≤ `capacity` | `input` 保证 | `ring` 跨窗口切分时的 `debug_assert` 前提 | `seek` 只按换行符定位 |
 | 数据区任意时刻都是完整记录的串（不跨环拆行） | `ring` 的换行填充 | `ring` | `seek` 的扫描、`follow` 的输出 |
 | 「头部 + 数据」来自同一一致状态 | `Reader::with_snapshot` | `ring` 的 flock 协议 | `follow`、`info`、`seek` 调用方 |
-| 同一文件同一时刻只有一个写者 | `Ring::open` 的 `<FILE>.lock` flock | `ring` | `cli` 的帮助文案 |
+| 同一文件同一时刻只有一个写者 | `Ring::open` 按规范路径派生 `<FILE>.lock` 后 flock | `ring` | `cli` 的帮助文案 |
 | `capacity = 文件大小 - 4 KiB` | `format::{MIN_TOTAL_SIZE, data_capacity, file_size}` | `ring`、`cli` 共用 | `input`（记录上限） |
 
 ## 7. 错误与退出码

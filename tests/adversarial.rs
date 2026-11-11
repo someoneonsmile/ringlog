@@ -6,21 +6,15 @@
 
 mod common;
 
-use common::{TestDir, bin, path_text};
+use common::{TestDir, bin, lock_path, path_text};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn lock_path(file: &Path) -> PathBuf {
-    let mut name = file.as_os_str().to_owned();
-    name.push(".lock");
-    PathBuf::from(name)
-}
 
 fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration, what: &str) {
     let deadline = Instant::now() + timeout;
@@ -36,8 +30,17 @@ fn lock_held_by_other(lock: &Path) -> bool {
 
 /// 等到写者已经持有侧车锁（而不是仅创建了锁文件）。
 fn wait_writer_ready(file: &Path) {
-    let lock = lock_path(file);
-    wait_until(|| lock.exists(), Duration::from_secs(5), "锁文件出现");
+    // 写者先创建数据文件再取锁，锁路径由规范路径决定：每轮重新求值，
+    // 避免在数据文件/符号链接尚未出现时缓存了错误的路径。
+    let mut lock = lock_path(file);
+    wait_until(
+        || {
+            lock = lock_path(file);
+            lock.exists()
+        },
+        Duration::from_secs(5),
+        "锁文件出现",
+    );
     wait_until(
         || lock_held_by_other(&lock),
         Duration::from_secs(5),

@@ -1,7 +1,7 @@
 //! 文件读写层。
 //!
-//! - 写者（[`Ring`]）：持有侧车锁文件保证进程级互斥；每批记录在文件级互斥锁内
-//!   写入数据、再更新头部，保证读者永远看不到写了一半的记录。
+//! - 写者（[`Ring`]）：持有侧车锁文件（按目标文件的规范路径派生）保证进程级互斥；
+//!   每批记录在文件级互斥锁内写入数据、再更新头部，保证读者永远看不到写了一半的记录。
 //! - 读者（[`Reader`]）：在文件级共享锁内读取「头部 + 数据」，拿到一致快照。
 //!
 //! 数据区是真正的环形：空间不足时用换行填充到文件尾，再从 0 继续写，
@@ -23,11 +23,33 @@ use memchr::memchr_iter;
 const PAD_CHUNK: usize = 64 * 1024;
 static PAD_BYTES: [u8; PAD_CHUNK] = [b'\n'; PAD_CHUNK];
 
-/// 写者互斥锁文件的路径：`<FILE>.lock`。
-pub fn lock_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
+/// 写者互斥锁文件的路径：目标文件规范路径的 `<FILE>.lock`。
+///
+/// 锁按「文件」而不是「路径字符串」取：相对路径、`..`、符号链接都归一到同一把锁，
+/// 否则同一个文件的两种写法会各自建一个锁文件，单写者保证被绕过。目标文件尚不存在
+/// （首次创建）时退化为「规范化父目录 + 文件名」。
+pub fn lock_path(path: &Path) -> io::Result<PathBuf> {
+    let mut name = canonical_target(path)?.into_os_string();
     name.push(".lock");
-    PathBuf::from(name)
+    Ok(PathBuf::from(name))
+}
+
+/// 解析目标文件的稳定绝对路径；文件尚不存在时解析其父目录。
+fn canonical_target(path: &Path) -> io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let name = path
+                .file_name()
+                .ok_or_else(|| usage(format!("{} 不是有效的文件路径", path.display())))?;
+            let parent = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            Ok(parent.canonicalize()?.join(name))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// 读取头区，返回两个 slot 中序号更大的有效头部。
@@ -81,17 +103,18 @@ struct State {
 
 /// 取得写者独占锁；同一文件已有写者时返回用法错误。
 fn acquire_writer_lock(path: &Path) -> io::Result<File> {
-    let lock_file = lock_path(path);
+    let lock_file_path = lock_path(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("无法确定锁文件路径: {e}")))?;
     let writer_lock = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_file)
+        .open(&lock_file_path)
         .map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("无法创建锁文件 {}: {e}", lock_file.display()),
+                format!("无法创建锁文件 {}: {e}", lock_file_path.display()),
             )
         })?;
     match writer_lock.try_lock() {
@@ -99,7 +122,7 @@ fn acquire_writer_lock(path: &Path) -> io::Result<File> {
         Err(TryLockError::WouldBlock) => Err(usage(format!(
             "{} 正被另一个写入进程使用（锁文件：{}）",
             path.display(),
-            lock_file.display()
+            lock_file_path.display()
         ))),
         Err(TryLockError::Error(e)) => Err(e),
     }
@@ -194,8 +217,10 @@ impl Ring {
     ///
     /// `total_size` 是文件总大小（含 4 KiB 头区）；`force` 会丢弃已有数据并重建。
     pub fn open(path: &Path, total_size: u64, force: bool, sync: bool) -> io::Result<Self> {
-        let writer_lock = acquire_writer_lock(path)?;
+        // 先打开（必要时创建）数据文件，再取锁：这样符号链接即使指向尚不存在的目标，
+        // 也会在创建后解析到真实路径，锁才能落在同一个文件上。
         let file = open_file(path)?;
+        let writer_lock = acquire_writer_lock(path)?;
         let existing = read_header(&file)?;
         let state = if force || file.metadata()?.len() == 0 {
             initialize(&file, total_size, existing, sync)?
