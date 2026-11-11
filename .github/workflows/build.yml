@@ -26,6 +26,13 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: ringlog-aarch64-linux-gnu
+          # macOS：macos-26-intel 是 Intel(x86_64) 标准 runner，macos-26 是 Apple Silicon(arm64) 标准 runner
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+            asset: ringlog-x86_64-darwin
+          - os: macos-26
+            target: aarch64-apple-darwin
+            asset: ringlog-aarch64-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
