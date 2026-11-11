@@ -184,3 +184,9 @@ cargo build --release          # target/release/ringlog
 cargo test                     # 单元测试 + 黑盒集成测试
 cargo clippy --all-targets
 ```
+
+shell 补全（bash/zsh/fish/elvish/powershell）和 man 手册页由 `build.rs` 生成：只有设置了
+`SHELL_HELP_DIR` 才写入 `$SHELL_HELP_DIR/complete/` 与 `$SHELL_HELP_DIR/man/`，否则静默跳过，
+普通 `cargo build` 不会在源码树里产生文件。日常用 `just build` / `just release` / `just install`
+（自动设置该变量），`just clean` 会连同 `shell_help/` 一起清理。发布资产和 AUR 包会带上
+bash/zsh/fish 补全与 man 页。

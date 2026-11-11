@@ -1,0 +1,89 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version_suffix:
+        required: false
+        type: string
+        default: ''
+        description: 'Appended to Cargo.toml version (e.g. "-nightly-20261111-10-g9bfdebec")'
+
+jobs:
+  build:
+    env:
+      SHELL_HELP_DIR: shell_help
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: ringlog-x86_64-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: ringlog-x86_64-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: ringlog-aarch64-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (musl build)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Override version for nightly
+        if: inputs.version_suffix != ''
+        shell: bash
+        run: |
+          CURRENT=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          NEW="${CURRENT}${{ inputs.version_suffix }}"
+          sed -i.bak "1,/^version = /s/^version = \".*\"/version = \"${NEW}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Build version: ${NEW}"
+
+      - name: Build (native)
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (musl via cross)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          staging="${{ matrix.asset }}"
+          mkdir -p "$staging" artifacts
+
+          # 复制二进制文件
+          cp "target/${{ matrix.target }}/release/ringlog" "$staging/"
+
+          # 复制 build.rs 生成的 shell 补全（bash/zsh/fish/elvish/powershell）与 man 手册页
+          cp -r "${SHELL_HELP_DIR}/complete" "$staging/"
+          cp -r "${SHELL_HELP_DIR}/man" "$staging/"
+
+          # 复制 README 和 LICENSE
+          cp README.md LICENSE "$staging/"
+
+          # 打包为 tar.gz
+          tar czf "artifacts/$staging.tar.gz" "$staging"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: artifacts/${{ matrix.asset }}.tar.gz

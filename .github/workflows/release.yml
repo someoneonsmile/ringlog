@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate changelog
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v6
+        with:
+          mode: COMMIT
+          toTag: ${{ github.ref_name }}
+          configurationJson: |
+            {
+              "label_extractor": [
+                {
+                  "pattern": "^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test){1}(\\([\\w\\-\\.]+\\))?(!)?: (.+)",
+                  "on_property": "title",
+                  "target": "$1"
+                }
+              ],
+              "categories": [
+                { "title": "## 🚀 新功能", "labels": ["feat", "feature"] },
+                { "title": "## 🐛 修复", "labels": ["fix", "bugfix", "bug"] },
+                { "title": "## 📚 文档", "labels": ["docs", "documentation"] },
+                { "title": "## ⚡ 性能", "labels": ["perf", "performance"] },
+                { "title": "## 🔧 维护", "labels": ["chore", "refactor", "ci", "test", "build", "revert", "style", "deps"] },
+                { "title": "## 其他变更", "labels": ["*"] }
+              ]
+            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old versioned release (in case tag was moved)
+        run: gh release delete ${{ github.ref_name }} --yes || true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Publish versioned release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          body: ${{ steps.changelog.outputs.changelog }}
+
+  aur:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Update PKGBUILD version
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" aur/PKGBUILD
+          sed -i 's/^pkgrel=.*/pkgrel=1/' aur/PKGBUILD
+
+      - name: Regenerate .SRCINFO
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}/aur:/work" \
+            -w /work \
+            archlinux:latest \
+            makepkg --printsrcinfo > aur/.SRCINFO
+
+      - name: Configure SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          cat >> ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            StrictHostKeyChecking accept-new
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push to AUR
+        env:
+          AUR_REPO: ssh://aur@aur.archlinux.org/ringlog-bin.git
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          git add aur/
+          git commit -m "chore: update AUR to ${VERSION}" || echo "No changes to commit"
+
+          # clone AUR 仓库拿到完整历史（保证 fast-forward，AUR 禁止 force push），复制文件后推送
+          TMP=$(mktemp -d)
+          git clone "${AUR_REPO}" "$TMP"
+          cp aur/PKGBUILD aur/.SRCINFO "$TMP/"
+          git -C "$TMP" add -A
+          git -C "$TMP" config user.name "GitHub Actions"
+          git -C "$TMP" config user.email "actions@github.com"
+          git -C "$TMP" commit -m "chore: update to ${VERSION}" || echo "No changes"
+          for i in 1 2 3; do
+            if git -C "$TMP" push origin master; then
+              echo "AUR push succeeded"
+              break
+            fi
+            echo "Push attempt $i failed, retrying in 10s..."
+            sleep 10
+            if [ "$i" -eq 3 ]; then
+              echo "::error::AUR push failed after 3 attempts"
+              exit 1
+            fi
+          done
+          rm -rf "$TMP"

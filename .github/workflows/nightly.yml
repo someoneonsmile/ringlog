@@ -1,0 +1,202 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      version_suffix: ${{ steps.vars.outputs.version_suffix }}
+      pkgver: ${{ steps.vars.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute nightly version vars
+        id: vars
+        run: |
+          DATE=$(date +%Y%m%d)
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          # 距上次稳定版 tag (v*) 的提交次数，保证当天多次构建时版本号单调递增（参考 neovim nightly）
+          LAST_STABLE_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null) || true
+          if [ -n "$LAST_STABLE_TAG" ]; then
+            COMMIT_COUNT=$(git rev-list --count "${LAST_STABLE_TAG}..HEAD")
+          else
+            COMMIT_COUNT=$(git rev-list --count HEAD)
+          fi
+          CARGO_VER=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+
+          # 版本号只在此处计算一次，其余 job 直接引用输出，避免重复计算导致不一致
+          echo "version_suffix=-nightly-${DATE}-${COMMIT_COUNT}-g${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "pkgver=${CARGO_VER}+nightly+${DATE}+${COMMIT_COUNT}+g${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for changes since last nightly
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NIGHTLY_SHA=$(gh api repos/${{ github.repository }}/git/ref/tags/nightly \
+            --jq '.object.sha' 2>/dev/null) || true
+
+          if [ -n "$NIGHTLY_SHA" ]; then
+            if [ "$NIGHTLY_SHA" = "${{ github.sha }}" ]; then
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              echo "No changes since last nightly, skipping."
+            else
+              echo "proceed=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "First nightly build."
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      version_suffix: ${{ needs.check.outputs.version_suffix }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Get latest stable release tag
+        id: latest
+        run: |
+          TAG=$(gh release list --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate changelog
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v6
+        with:
+          mode: COMMIT
+          fromTag: ${{ steps.latest.outputs.tag }}
+          toTag: ${{ github.sha }}
+          configurationJson: |
+            {
+              "label_extractor": [
+                {
+                  "pattern": "^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test){1}(\\([\\w\\-\\.]+\\))?(!)?: (.+)",
+                  "on_property": "title",
+                  "target": "$1"
+                }
+              ],
+              "categories": [
+                { "title": "## 🚀 新功能", "labels": ["feat", "feature"] },
+                { "title": "## 🐛 修复", "labels": ["fix", "bugfix", "bug"] },
+                { "title": "## 📚 文档", "labels": ["docs", "documentation"] },
+                { "title": "## ⚡ 性能", "labels": ["perf", "performance"] },
+                { "title": "## 🔧 维护", "labels": ["chore", "refactor", "ci", "test", "build", "revert", "style", "deps"] },
+                { "title": "## 其他变更", "labels": ["*"] }
+              ]
+            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old nightly rolling release
+        run: gh release delete nightly --cleanup-tag --yes || true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Publish nightly rolling release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          # 固定到本次构建的 commit，避免构建期间默认分支前进导致 tag 与资产不对应
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          prerelease: true
+          body: ${{ steps.changelog.outputs.changelog }}
+
+  aur:
+    needs: [release, check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Update PKGBUILD version
+        env:
+          PKGVER: ${{ needs.check.outputs.pkgver }}
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" aur-nightly/PKGBUILD
+          sed -i 's/^pkgrel=.*/pkgrel=1/' aur-nightly/PKGBUILD
+          echo "AUR pkgver: ${PKGVER}"
+
+      - name: Regenerate .SRCINFO
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}/aur-nightly:/work" \
+            -w /work \
+            archlinux:latest \
+            makepkg --printsrcinfo > aur-nightly/.SRCINFO
+
+      - name: Configure SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          cat >> ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            StrictHostKeyChecking accept-new
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push to AUR nightly
+        env:
+          AUR_REPO: ssh://aur@aur.archlinux.org/ringlog-nightly-bin.git
+          PKGVER: ${{ needs.check.outputs.pkgver }}
+        run: |
+          git add aur-nightly/
+          git commit -m "chore: update nightly AUR to ${PKGVER}" || echo "No changes to commit"
+
+          # clone AUR 仓库拿到完整历史（保证 fast-forward，AUR 禁止 force push），复制文件后推送
+          TMP=$(mktemp -d)
+          git clone "${AUR_REPO}" "$TMP"
+          cp aur-nightly/PKGBUILD aur-nightly/.SRCINFO "$TMP/"
+          git -C "$TMP" add -A
+          git -C "$TMP" config user.name "GitHub Actions"
+          git -C "$TMP" config user.email "actions@github.com"
+          git -C "$TMP" commit -m "chore: update to ${PKGVER}" || echo "No changes"
+          for i in 1 2 3; do
+            if git -C "$TMP" push origin master; then
+              echo "AUR push succeeded"
+              break
+            fi
+            echo "Push attempt $i failed, retrying in 10s..."
+            sleep 10
+            if [ "$i" -eq 3 ]; then
+              echo "::error::AUR push failed after 3 attempts"
+              exit 1
+            fi
+          done
+          rm -rf "$TMP"

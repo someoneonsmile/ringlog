@@ -1,0 +1,16 @@
+pkgbase = ringlog-bin
+	pkgdesc = Fixed-size single-file ring log: pipe data in, overwrite oldest when full, follow with -f
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/someoneonsmile/ringlog
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	provides = ringlog
+	conflicts = ringlog
+	source_x86_64 = ringlog-0.1.0-x86_64-linux-gnu.tar.gz::https://github.com/someoneonsmile/ringlog/releases/download/v0.1.0/ringlog-x86_64-linux-gnu.tar.gz
+	sha256sums_x86_64 = SKIP
+	source_aarch64 = ringlog-0.1.0-aarch64-linux-gnu.tar.gz::https://github.com/someoneonsmile/ringlog/releases/download/v0.1.0/ringlog-aarch64-linux-gnu.tar.gz
+	sha256sums_aarch64 = SKIP
+
+pkgname = ringlog-bin
