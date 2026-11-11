@@ -14,7 +14,7 @@ use clap::{CommandFactory, Parser};
 use ringlog::format::MIN_TOTAL_SIZE;
 use ringlog::seek::StartPos;
 
-use super::cli_types::Args;
+use super::cli_types::{Args, MAX_TOTAL_SIZE};
 
 /// 命令行模式。每种模式只携带自己用得到的参数，非法组合无法表达。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +100,11 @@ impl Args {
                     "-s 至少为 {MIN_TOTAL_SIZE} 字节（4 KiB 头区 + 4 KiB 数据区）"
                 )));
             }
+            if size > MAX_TOTAL_SIZE {
+                return Err(usage_error(format!(
+                    "-s 最大为 {MAX_TOTAL_SIZE} 字节（1 TiB）"
+                )));
+            }
             Mode::Write { size, sync, force }
         };
 
@@ -153,6 +158,16 @@ mod tests {
     #[test]
     fn size_too_small_rejected() {
         assert!(parse_args(&["-s", "4K", "/tmp/x.ring"]).is_err());
+    }
+
+    #[test]
+    fn size_too_large_rejected() {
+        // 1 TiB 正好允许，多 1 字节就拒绝。
+        assert!(parse_args(&["-s", "1T", "/tmp/x.ring"]).is_ok());
+        let over = (MAX_TOTAL_SIZE + 1).to_string();
+        let err = parse_args(&["-s", &over, "/tmp/x.ring"]).unwrap_err();
+        assert!(err.to_string().contains("1 TiB"), "err={err}");
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

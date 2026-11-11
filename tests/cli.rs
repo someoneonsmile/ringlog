@@ -263,6 +263,17 @@ fn second_writer_is_rejected() {
 }
 
 #[test]
+fn size_over_max_rejected() {
+    let dir = TestDir::new("it");
+    let file = dir.file("too-big.ring");
+
+    let out = write_stdin(&file, "2T", b"x\n");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 TiB"));
+    assert!(!file.exists(), "参数校验失败不应创建文件");
+}
+
+#[test]
 fn size_mismatch_needs_force() {
     let dir = TestDir::new("it");
     let file = dir.file("mismatch.ring");

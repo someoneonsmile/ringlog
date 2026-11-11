@@ -48,7 +48,7 @@ const AFTER_HELP: &str = "\
     disable_version_flag = true
 )]
 pub struct Args {
-    /// 文件总大小，如 64M、1.5G、10485760（含 4 KiB 头区，至少 8K）
+    /// 文件总大小，如 64M、1.5G、10485760（含 4 KiB 头区，至少 8K，最多 1T）
     #[arg(short = 's', long = "size", value_name = "SIZE", value_parser = parse_size)]
     pub size: Option<u64>,
 
@@ -89,7 +89,14 @@ pub struct Args {
     pub version: Option<bool>,
 }
 
-/// 解析大小：`10485760`、`64K`、`64KiB`、`1G`、`2TB`、`1.5G`（K/M/G/T 均为 1024 进制）。
+/// `-s` 允许的最大文件总大小（1 TiB）。
+///
+/// 上限属于命令行策略而非文件格式：格式本身能表达任意 `u64` 容量，但环形日志
+/// 用不到 1 TiB 以上；而常见文件系统的单文件上限各不相同（如 ext4 为 16 TiB），
+/// 统一挡住可以避免 `-s` 过大时只在部分文件系统上报 EFBIG。
+pub const MAX_TOTAL_SIZE: u64 = 1 << 40;
+
+/// 解析大小：`10485760`、`64K`、`64KiB`、`1G`、`1T`、`1.5G`（K/M/G/T 均为 1024 进制）。
 pub fn parse_size(text: &str) -> Result<u64, String> {
     match parse_size::Config::new().with_binary().parse_size(text) {
         Ok(0) => Err("大小不能为 0".into()),
