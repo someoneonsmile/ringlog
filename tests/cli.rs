@@ -609,6 +609,7 @@ fn newest_header_slot_corruption_falls_back() {
     assert!(write_stdin(&file, "8K", b"a\nb\nc\n").status.success());
 
     // 初始化 seq=1 落在 slot B（偏移 64）；追加一批后 seq=2 落在 slot A（偏移 0，最新）。
+    // 改坏 slot A 里的 seq 字段（偏移 16..24），其 CRC 随之失效。
     let mut data = fs::read(&file).unwrap();
     assert_eq!(data.len(), 8192);
     data[20] ^= 0xff;

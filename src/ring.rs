@@ -7,6 +7,7 @@
 //! 数据区是真正的环形：空间不足时用换行填充到文件尾，再从 0 继续写，
 //! 因此任何时刻数据区里都是一串以 `\n` 结尾的完整记录。
 
+use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -14,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{invalid, usage};
 use crate::format::{
-    DATA_OFFSET, HEADER_PAGE, Header, MIN_DATA_CAPACITY, MIN_TOTAL_SIZE, SLOT_BYTES, SLOT_OFFSETS,
-    data_capacity, file_size,
+    DATA_OFFSET, HEADER_PAGE, Header, HeaderError, MIN_DATA_CAPACITY, MIN_TOTAL_SIZE, SLOT_BYTES,
+    SLOT_OFFSETS, data_capacity, file_size,
 };
 use memchr::memchr_iter;
 
@@ -52,25 +53,118 @@ fn canonical_target(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// 头区读不出来时的原因，用来给用户可操作的提示。
+#[derive(Debug, Clone, Copy)]
+enum HeaderFailure {
+    /// 文件长度连 4 KiB 头区都不够（写者会初始化空文件，读者会拒绝）。
+    Truncated { len: u64 },
+    /// 两个 slot 都解析失败；取其中信息量最大的原因。
+    Invalid(HeaderError),
+}
+
+impl fmt::Display for HeaderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated { len } => {
+                write!(f, "文件只有 {len} 字节，不足 {HEADER_PAGE} 字节头区")
+            }
+            Self::Invalid(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// 读取头区，返回两个 slot 中序号更大的有效头部。
-pub fn read_header(file: &File) -> io::Result<Option<Header>> {
-    if file.metadata()?.len() < HEADER_PAGE {
-        return Ok(None);
+///
+/// 外层 `Err` 是 I/O 失败；内层 `Err` 表示「文件读出来了，但不能当 ringlog 用」，
+/// 附带具体原因（不是 ringlog / 版本不支持 / 头部损坏），供上层给出准确提示。
+fn read_header(file: &File) -> io::Result<Result<Header, HeaderFailure>> {
+    let len = file.metadata()?.len();
+    if len < HEADER_PAGE {
+        return Ok(Err(HeaderFailure::Truncated { len }));
     }
     let mut page = [0u8; HEADER_PAGE as usize];
     file.read_exact_at(&mut page, 0)?;
     let mut best: Option<Header> = None;
+    let mut failure: Option<HeaderError> = None;
     for off in SLOT_OFFSETS {
         let off = off as usize;
         let mut buf = [0u8; SLOT_BYTES];
         buf.copy_from_slice(&page[off..off + SLOT_BYTES]);
-        if let Some(header) = Header::from_slot(&buf)
-            && best.is_none_or(|b| header.seq > b.seq)
-        {
-            best = Some(header);
+        match Header::from_slot(&buf) {
+            Ok(header) if best.is_none_or(|b| header.seq > b.seq) => best = Some(header),
+            Ok(_) => {}
+            Err(error) => {
+                failure = Some(match failure {
+                    Some(previous) => preferred_error(previous, error),
+                    None => error,
+                });
+            }
         }
     }
-    Ok(best)
+    Ok(match best {
+        Some(header) => Ok(header),
+        // 两个 slot 都不是有效头部，failure 必然已有值；兜底用 Corrupt。
+        None => Err(HeaderFailure::Invalid(
+            failure.unwrap_or(HeaderError::Corrupt),
+        )),
+    })
+}
+
+/// 两个 slot 都无效时保留信息量更大的原因：不是 ringlog < 已损坏 < 版本不支持。
+///
+/// 混合状态（一个 slot 像 ringlog、另一个是垃圾）应报「损坏」；而文件明显是新版
+/// ringlog 写的时候应报「版本不支持」——后者才是用户真正需要知道的事实。
+fn preferred_error(current: HeaderError, next: HeaderError) -> HeaderError {
+    fn rank(error: HeaderError) -> u8 {
+        match error {
+            HeaderError::NotRinglog => 0,
+            HeaderError::Corrupt => 1,
+            HeaderError::UnsupportedVersion { .. } => 2,
+        }
+    }
+    if rank(next) > rank(current) {
+        next
+    } else {
+        current
+    }
+}
+
+/// 调用方身份：决定错误提示的口吻与处置建议。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Writer,
+    Reader,
+}
+
+/// 头区不可用时的用户提示。
+///
+/// 写者与读者的开头语不同：写者强调「不会覆盖已有文件」，读者强调「这个文件读不了」。
+/// 版本不支持单独成一类——文件本身没坏，只是本程序太旧，不能报成「文件损坏」。
+fn header_error(path: &Path, failure: HeaderFailure, role: Role) -> io::Error {
+    let writer = role == Role::Writer;
+    let unsupported = matches!(
+        failure,
+        HeaderFailure::Invalid(HeaderError::UnsupportedVersion { .. })
+    );
+    let opening = match (writer, unsupported) {
+        (_, true) => "的格式版本不受支持",
+        (true, false) => "的文件头无效",
+        (false, false) => "不是有效的 ringlog 文件",
+    };
+    let remedy = if unsupported {
+        if writer {
+            "；请改用支持该格式版本的 ringlog（本程序不会覆盖已有文件）"
+        } else {
+            "；请改用支持该格式版本的 ringlog"
+        }
+    } else if writer {
+        "；ringlog 不会覆盖已有文件，如需重建请先停止写入进程并删除该文件"
+    } else if matches!(failure, HeaderFailure::Truncated { .. }) {
+        "；文件可能尚未初始化"
+    } else {
+        ""
+    };
+    invalid(format!("{} {opening}：{failure}{remedy}", path.display()))
 }
 
 fn write_slot(file: &File, header: &Header) -> io::Result<()> {
@@ -157,12 +251,7 @@ fn initialize(file: &File, total_size: u64, sync: bool) -> io::Result<State> {
 }
 
 /// 校验已有文件并恢复续写状态。
-fn resume(
-    file: &File,
-    path: &Path,
-    total_size: u64,
-    existing: Option<Header>,
-) -> io::Result<State> {
+fn resume(file: &File, path: &Path, total_size: u64, header: Header) -> io::Result<State> {
     let len = file.metadata()?.len();
     let capacity = data_capacity(len).ok_or_else(|| {
         invalid(format!(
@@ -179,12 +268,6 @@ fn resume(
             total_size
         )));
     }
-    let header = existing.ok_or_else(|| {
-        invalid(format!(
-            "{} 的文件头无效（不是 ringlog 文件或已损坏）；ringlog 不会覆盖已有文件。如需重建，请先停止写入进程并删除该文件",
-            path.display()
-        ))
-    })?;
     if header.capacity != capacity {
         return Err(invalid(format!(
             "{} 头区记录的容量 {} 与实际数据区 {} 不一致（头部损坏或文件被外部改写）。如需重建，请先停止写入进程并删除该文件",
@@ -211,11 +294,12 @@ impl Ring {
         // 也会在创建后解析到真实路径，锁才能落在同一个文件上。
         let file = open_file(path)?;
         let writer_lock = acquire_writer_lock(path)?;
-        let existing = read_header(&file)?;
         let state = if file.metadata()?.len() == 0 {
             initialize(&file, total_size, sync)?
         } else {
-            resume(&file, path, total_size, existing)?
+            let header =
+                read_header(&file)?.map_err(|failure| header_error(path, failure, Role::Writer))?;
+            resume(&file, path, total_size, header)?
         };
         Ok(Self {
             file,
@@ -382,12 +466,8 @@ impl Reader {
             .open(path)
             .map_err(|e| io::Error::new(e.kind(), format!("无法打开 {}: {e}", path.display())))?;
         let len = file.metadata()?.len();
-        let header = read_header(&file)?.ok_or_else(|| {
-            invalid(format!(
-                "{} 不是有效的 ringlog 文件（文件头缺失或损坏）",
-                path.display()
-            ))
-        })?;
+        let header =
+            read_header(&file)?.map_err(|failure| header_error(path, failure, Role::Reader))?;
         if file_size(header.capacity) != len {
             return Err(invalid(format!(
                 "{} 的文件大小与头区容量不一致（文件可能被截断或外部改写）",
@@ -417,7 +497,11 @@ impl Reader {
         let result = (|| {
             let header = read_header(&self.file)
                 .map_err(|e| invalid(format!("读取文件头失败（文件可能被外部改写）: {e}")))?
-                .ok_or_else(|| invalid("读取过程中文件头失效（文件可能被截断或正在初始化）"))?;
+                .map_err(|failure| {
+                    invalid(format!(
+                        "读取过程中文件头失效（{failure}），文件可能被截断或正在初始化"
+                    ))
+                })?;
             if header.capacity != self.capacity {
                 return Err(invalid(
                     "文件容量已变化（文件可能被外部改写），请重启读取进程",

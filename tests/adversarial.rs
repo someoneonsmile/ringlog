@@ -355,6 +355,9 @@ impl Drop for GuardChild {
 // ---------------------------------------------------------------------------
 
 const SLOT_BYTES: usize = 64;
+const SLOT_MAGIC: [u8; 8] = *b"RINGLOG\0";
+const SLOT_VERSION: u32 = 1;
+const SLOT_CRC_OFFSET: usize = 60;
 
 #[derive(Clone, Copy, Debug)]
 struct Slot {
@@ -381,24 +384,23 @@ fn crc32c(data: &[u8]) -> u32 {
 
 fn parse_slot(buf: &[u8]) -> Option<Slot> {
     assert_eq!(buf.len(), SLOT_BYTES);
-    let stored = u32::from_le_bytes(buf[56..60].try_into().unwrap());
-    if crc32c(&buf[..56]) != stored {
+    let stored = u32::from_le_bytes(buf[SLOT_CRC_OFFSET..].try_into().unwrap());
+    if crc32c(&buf[..SLOT_CRC_OFFSET]) != stored {
         return None;
     }
-    let magic = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    if magic != u64::from_le_bytes(*b"RINGLOG1") {
+    if buf[..8] != SLOT_MAGIC[..] {
         return None;
     }
-    if u32::from_le_bytes(buf[8..12].try_into().unwrap()) != 1 {
+    if u32::from_le_bytes(buf[8..12].try_into().unwrap()) != SLOT_VERSION {
         return None;
     }
     if u32::from_le_bytes(buf[12..16].try_into().unwrap()) != SLOT_BYTES as u32 {
         return None;
     }
-    let capacity = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let write_pos = u64::from_le_bytes(buf[24..32].try_into().unwrap());
-    let total_written = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-    let seq = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+    let seq = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let capacity = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+    let write_pos = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+    let total_written = u64::from_le_bytes(buf[40..48].try_into().unwrap());
     if capacity == 0 || write_pos >= capacity || total_written % capacity != write_pos {
         return None;
     }
@@ -444,16 +446,26 @@ fn max_seq(file: &Path) -> Option<u64> {
 
 fn build_slot(seq: u64, capacity: u64, write_pos: u64, total: u64) -> [u8; 64] {
     let mut buf = [0u8; 64];
-    buf[0..8].copy_from_slice(&u64::from_le_bytes(*b"RINGLOG1").to_le_bytes());
-    buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+    buf[0..8].copy_from_slice(&SLOT_MAGIC);
+    buf[8..12].copy_from_slice(&SLOT_VERSION.to_le_bytes());
     buf[12..16].copy_from_slice(&(SLOT_BYTES as u32).to_le_bytes());
-    buf[16..24].copy_from_slice(&capacity.to_le_bytes());
-    buf[24..32].copy_from_slice(&write_pos.to_le_bytes());
-    buf[32..40].copy_from_slice(&total.to_le_bytes());
-    buf[40..48].copy_from_slice(&seq.to_le_bytes());
-    let crc = crc32c(&buf[..56]);
-    buf[56..60].copy_from_slice(&crc.to_le_bytes());
+    buf[16..24].copy_from_slice(&seq.to_le_bytes());
+    buf[24..32].copy_from_slice(&capacity.to_le_bytes());
+    buf[32..40].copy_from_slice(&write_pos.to_le_bytes());
+    buf[40..48].copy_from_slice(&total.to_le_bytes());
+    let crc = crc32c(&buf[..SLOT_CRC_OFFSET]);
+    buf[SLOT_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
     buf
+}
+
+/// 把某个 slot 版本改成 `version` 并重算 CRC，模拟「新版程序写出的文件」。
+fn patch_slot_version(file: &Path, idx: usize, version: u32) {
+    let mut bytes = fs::read(file).unwrap();
+    let start = idx * SLOT_BYTES;
+    bytes[start + 8..start + 12].copy_from_slice(&version.to_le_bytes());
+    let crc = crc32c(&bytes[start..start + SLOT_CRC_OFFSET]);
+    bytes[start + SLOT_CRC_OFFSET..start + SLOT_BYTES].copy_from_slice(&crc.to_le_bytes());
+    fs::write(file, bytes).unwrap();
 }
 
 fn patch_slot(file: &Path, idx: usize, slot: &[u8; 64]) {
@@ -851,6 +863,52 @@ fn both_slots_corrupt_are_rejected() {
     );
     assert_eq!(fs::read(&file).unwrap(), broken, "失败时不能改文件内容");
     assert_ne!(before, broken);
+}
+
+#[test]
+fn future_format_version_is_reported_as_version_mismatch() {
+    let dir = TestDir::new("adv");
+    let file = dir.file("future.ring");
+    assert_eq!(write_stdin(&file, "8K", b"old\n").code(), Some(0));
+
+    // 只把最新 slot 改成「版本 2 + 合法 CRC」：读者应正常回退到旧 slot，
+    // 不能因为读不懂某个 slot 就整体拒绝文件。
+    let newest = read_slots(&file)
+        .iter()
+        .flatten()
+        .max_by_key(|slot| slot.seq)
+        .copied()
+        .unwrap();
+    let newest_idx = (newest.seq % 2) as usize;
+    patch_slot_version(&file, newest_idx, SLOT_VERSION + 1);
+    let out = run(&["-n", "100", path_text(&file)]);
+    assert_eq!(out.code(), Some(0), "应回退到有效 slot: {}", out.err());
+
+    // 两个 slot 都是新版：文件没坏，只是本程序太旧，必须报版本而不是损坏。
+    patch_slot_version(&file, 0, SLOT_VERSION + 1);
+    patch_slot_version(&file, 1, SLOT_VERSION + 1);
+
+    let out = run(&["-n", "1", path_text(&file)]);
+    assert_eq!(out.code(), Some(2), "读者应拒绝未来版本");
+    let stderr = out.err();
+    assert_no_panic(&stderr);
+    assert!(
+        stderr.contains("文件格式版本为 2") && stderr.contains("只支持版本 1"),
+        "读者应报出版本不匹配，stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("损坏"),
+        "版本不支持不等于文件损坏，stderr={stderr}"
+    );
+
+    let out = write_stdin(&file, "8K", b"x\n");
+    assert_eq!(out.code(), Some(2), "写者应拒绝未来版本");
+    let stderr = out.err();
+    assert_no_panic(&stderr);
+    assert!(
+        stderr.contains("文件格式版本为 2") && stderr.contains("不会覆盖"),
+        "写者应报出版本不匹配且不覆盖文件，stderr={stderr}"
+    );
 }
 
 #[test]
