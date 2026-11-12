@@ -20,7 +20,7 @@ use super::cli_types::{Args, MAX_TOTAL_SIZE};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// 写入：stdin 管道 → 环形文件。
-    Write { size: u64, sync: bool, force: bool },
+    Write { size: u64, sync: bool },
     /// 读取：先输出已有数据，可选持续跟随。
     Read {
         follow: bool,
@@ -55,7 +55,6 @@ impl Args {
             lines,
             interval_ms,
             sync,
-            force,
             info,
             file,
             help: _,
@@ -63,18 +62,16 @@ impl Args {
         } = self;
 
         let mode = if info {
-            if size.is_some() || lines.is_some() || follow || sync || force {
-                return Err(usage_error(
-                    "--info 不能与 -s / -n / -f / --sync / --force 同时使用",
-                ));
+            if size.is_some() || lines.is_some() || follow || sync {
+                return Err(usage_error("--info 不能与 -s / -n / -f / --sync 同时使用"));
             }
             Mode::Info
         } else if follow || lines.is_some() {
             if size.is_some() {
                 return Err(usage_error("读取模式（-f / -n）不能与 -s 同时使用"));
             }
-            if sync || force {
-                return Err(usage_error("--sync / --force 只用于写入模式"));
+            if sync {
+                return Err(usage_error("--sync 只用于写入模式"));
             }
             let start = match lines {
                 None => StartPos::Oldest,
@@ -105,7 +102,7 @@ impl Args {
                     "-s 最大为 {MAX_TOTAL_SIZE} 字节（1 TiB）"
                 )));
             }
-            Mode::Write { size, sync, force }
+            Mode::Write { size, sync }
         };
 
         Ok(Cli { path: file, mode })
@@ -149,8 +146,7 @@ mod tests {
             cli.mode,
             Mode::Write {
                 size: 64 * 1024,
-                sync: false,
-                force: false
+                sync: false
             }
         );
     }

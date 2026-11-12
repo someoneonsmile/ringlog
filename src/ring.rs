@@ -85,8 +85,6 @@ pub struct Ring {
     write_pos: u64,
     total_written: u64,
     seq: u64,
-    /// 文件重置纪元；`--force` 重建时 +1，读者据此识别“文件被重置”。
-    epoch: u64,
     sync: bool,
     /// 侧车锁文件的句柄；存活期间独占，进程退出/崩溃时由内核释放。
     _writer_lock: File,
@@ -98,7 +96,6 @@ struct State {
     write_pos: u64,
     total_written: u64,
     seq: u64,
-    epoch: u64,
 }
 
 /// 取得写者独占锁；同一文件已有写者时返回用法错误。
@@ -138,22 +135,16 @@ fn open_file(path: &Path) -> io::Result<File> {
         .map_err(|e| io::Error::new(e.kind(), format!("无法打开 {}: {e}", path.display())))
 }
 
-/// 初始化（或 `--force` 重建）文件，返回从零开始的写入状态。
-fn initialize(
-    file: &File,
-    total_size: u64,
-    existing: Option<Header>,
-    sync: bool,
-) -> io::Result<State> {
+/// 初始化空文件，返回从零开始的写入状态。
+fn initialize(file: &File, total_size: u64, sync: bool) -> io::Result<State> {
     let capacity = data_capacity(total_size).ok_or_else(|| {
         usage(format!(
             "文件总大小至少需要 {MIN_TOTAL_SIZE} 字节（4 KiB 头区 + {MIN_DATA_CAPACITY} 字节数据区），当前 -s 为 {total_size} 字节"
         ))
     })?;
     file.set_len(total_size)?;
-    let seq = existing.map_or(1, |h| h.seq.wrapping_add(1));
-    let epoch = existing.map_or(1, |h| h.epoch.wrapping_add(1).max(1));
-    write_slot(file, &Header::new(seq, epoch, capacity))?;
+    let seq = 1;
+    write_slot(file, &Header::new(seq, capacity))?;
     if sync {
         file.sync_data()?;
     }
@@ -162,7 +153,6 @@ fn initialize(
         write_pos: 0,
         total_written: 0,
         seq,
-        epoch,
     })
 }
 
@@ -183,7 +173,7 @@ fn resume(
     })?;
     if total_size != len {
         return Err(usage(format!(
-            "{} 现有大小 {} 字节，与 -s {} 不一致；确认要重建请加 --force",
+            "{} 现有大小 {} 字节，与 -s {} 不一致；ringlog 不允许改变已有文件的大小。如需重建，请先停止写入进程并删除该文件",
             path.display(),
             len,
             total_size
@@ -191,13 +181,13 @@ fn resume(
     }
     let header = existing.ok_or_else(|| {
         invalid(format!(
-            "{} 的文件头无效（不是 ringlog 文件或已损坏）；确认覆盖请加 --force",
+            "{} 的文件头无效（不是 ringlog 文件或已损坏）；ringlog 不会覆盖已有文件。如需重建，请先停止写入进程并删除该文件",
             path.display()
         ))
     })?;
     if header.capacity != capacity {
         return Err(invalid(format!(
-            "{} 头区记录的容量 {} 与实际数据区 {} 不一致；确认重建请加 --force",
+            "{} 头区记录的容量 {} 与实际数据区 {} 不一致（头部损坏或文件被外部改写）。如需重建，请先停止写入进程并删除该文件",
             path.display(),
             header.capacity,
             capacity
@@ -208,22 +198,22 @@ fn resume(
         write_pos: header.write_pos,
         total_written: header.total_written,
         seq: header.seq,
-        epoch: header.epoch,
     })
 }
 
 impl Ring {
     /// 打开或创建环形文件。
     ///
-    /// `total_size` 是文件总大小（含 4 KiB 头区）；`force` 会丢弃已有数据并重建。
-    pub fn open(path: &Path, total_size: u64, force: bool, sync: bool) -> io::Result<Self> {
+    /// `total_size` 是文件总大小（含 4 KiB 头区）。文件不存在或为空时按 `total_size`
+    /// 初始化；已有文件必须是同尺寸的有效 ringlog 文件，ringlog 不会重建它或改变它的大小。
+    pub fn open(path: &Path, total_size: u64, sync: bool) -> io::Result<Self> {
         // 先打开（必要时创建）数据文件，再取锁：这样符号链接即使指向尚不存在的目标，
         // 也会在创建后解析到真实路径，锁才能落在同一个文件上。
         let file = open_file(path)?;
         let writer_lock = acquire_writer_lock(path)?;
         let existing = read_header(&file)?;
-        let state = if force || file.metadata()?.len() == 0 {
-            initialize(&file, total_size, existing, sync)?
+        let state = if file.metadata()?.len() == 0 {
+            initialize(&file, total_size, sync)?
         } else {
             resume(&file, path, total_size, existing)?
         };
@@ -233,7 +223,6 @@ impl Ring {
             write_pos: state.write_pos,
             total_written: state.total_written,
             seq: state.seq,
-            epoch: state.epoch,
             sync,
             _writer_lock: writer_lock,
         })
@@ -279,7 +268,6 @@ impl Ring {
         self.seq += 1;
         let header = Header {
             seq: self.seq,
-            epoch: self.epoch,
             capacity: cap,
             write_pos: pos,
             total_written: total,
@@ -402,7 +390,7 @@ impl Reader {
         })?;
         if file_size(header.capacity) != len {
             return Err(invalid(format!(
-                "{} 的文件大小与头区容量不一致（文件可能被截断或重建）",
+                "{} 的文件大小与头区容量不一致（文件可能被截断或外部改写）",
                 path.display()
             )));
         }
@@ -428,10 +416,12 @@ impl Reader {
         self.file.lock_shared()?;
         let result = (|| {
             let header = read_header(&self.file)
-                .map_err(|e| invalid(format!("读取文件头失败（文件可能正在被重建）: {e}")))?
-                .ok_or_else(|| invalid("读取过程中文件头失效（写入进程可能正在初始化文件）"))?;
+                .map_err(|e| invalid(format!("读取文件头失败（文件可能被外部改写）: {e}")))?
+                .ok_or_else(|| invalid("读取过程中文件头失效（文件可能被截断或正在初始化）"))?;
             if header.capacity != self.capacity {
-                return Err(invalid("文件容量已变化（文件可能被重建），请重启读取进程"));
+                return Err(invalid(
+                    "文件容量已变化（文件可能被外部改写），请重启读取进程",
+                ));
             }
             f(self, &header)
         })();

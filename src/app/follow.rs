@@ -8,7 +8,7 @@
 //! - 之后持续输出新增记录；
 //! - 读者落后超过数据区容量时，旧数据已被覆盖：告警并跳至最旧可用数据，
 //!   从下一个换行符开始继续，丢弃可能不完整的记录；
-//! - 文件被 `--force` 重建（头部的 `epoch` 变化）时告警并重新定位。
+//! - 文件被外部截断并重新初始化（累计写入回退）时告警并重新定位。
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -54,8 +54,6 @@ struct Tailer<'a, W: Write> {
     /// 已消费但尚未构成完整记录（没有换行符）的尾部字节。
     pending: Vec<u8>,
     start: StartPos,
-    /// 当前跟随的“重置纪元”，与头部不一致说明文件被 `--force` 重建过。
-    epoch: u64,
     /// 上次打印“落后丢数据”告警之后累计丢失的字节数（避免告警刷屏）。
     lost_bytes: u64,
     last_warn: Option<Instant>,
@@ -65,7 +63,7 @@ struct Tailer<'a, W: Write> {
 enum Warning {
     /// 落后超过一整个数据区：`bytes` 为累计丢失量。
     Lost(u64),
-    /// 文件被重新初始化。
+    /// 文件被重新初始化（累计写入回退）。
     Reset,
 }
 
@@ -77,21 +75,19 @@ impl<'a, W: Write> Tailer<'a, W> {
             consumed: 0,
             pending: Vec::new(),
             start,
-            epoch: 0,
             lost_bytes: 0,
             last_warn: None,
         }
     }
 
     fn init(&mut self) -> io::Result<()> {
-        let (located, epoch) = self
+        let located = self
             .reader
-            .with_snapshot(|r, h| Ok((locate_start(r, h, self.start)?, h.epoch)))?;
+            .with_snapshot(|r, h| locate_start(r, h, self.start))?;
         if located.no_newline {
             warn_no_newline(located.dropped);
         }
         self.consumed = located.pos;
-        self.epoch = epoch;
         Ok(())
     }
 
@@ -104,17 +100,16 @@ impl<'a, W: Write> Tailer<'a, W> {
     /// 锁内只做「读头部 + 拷贝一块数据」；写 stdout 在锁外完成。
     fn step(&mut self) -> io::Result<bool> {
         let start = self.consumed;
-        let expected_epoch = self.epoch;
         let mut buf = vec![0u8; CHUNK];
-        let (consumed, read_len, warning, new_epoch, dropped_no_newline) =
+        let (consumed, read_len, warning, dropped_no_newline) =
             self.reader.with_snapshot(|r, h| {
                 let end = h.total_written;
-                // 纪元变化说明文件被 --force 重建；total_written 回退是兜底判断。
-                if h.epoch != expected_epoch || end < start {
-                    // 重建后的内容都算“新数据”，从头输出有效部分。
+                // 累计写入回退说明文件被外部截断并重新初始化。
+                if end < start {
+                    // 重置后的内容都算“新数据”，从头输出有效部分。
                     let located = locate_start(r, h, StartPos::Oldest)?;
                     let dropped = located.no_newline.then_some(located.dropped);
-                    return Ok((located.pos, 0, Some(Warning::Reset), Some(h.epoch), dropped));
+                    return Ok((located.pos, 0, Some(Warning::Reset), dropped));
                 }
                 let mut available = end - start;
                 let mut consumed = start;
@@ -135,15 +130,12 @@ impl<'a, W: Write> Tailer<'a, W> {
                     warning = Some(Warning::Lost(lost));
                 }
                 if available == 0 {
-                    return Ok((consumed, 0, warning, None, dropped));
+                    return Ok((consumed, 0, warning, dropped));
                 }
                 let n = available.min(CHUNK as u64) as usize;
                 r.read_exact_abs(consumed, &mut buf[..n])?;
-                Ok((consumed, n, warning, None, dropped))
+                Ok((consumed, n, warning, dropped))
             })?;
-        if let Some(epoch) = new_epoch {
-            self.epoch = epoch;
-        }
         if let Some(dropped) = dropped_no_newline {
             warn_no_newline(dropped);
         }

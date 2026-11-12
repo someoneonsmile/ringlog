@@ -1,7 +1,7 @@
 //! 对抗性黑盒测试：只通过命令行观察 ringlog 的对外行为。
 //!
 //! 覆盖极小容量边界、`-n` 边界、头部损坏、SIGKILL 续写、写者互斥、
-//! EPIPE、并发压测、`--force` 重置、异常文件与参数错误。
+//! EPIPE、并发压测、重置检测、异常文件与参数错误。
 //! 所有子进程都有超时或 Drop 清理，任何一条测试失败都不会把测试进程挂死。
 
 mod common;
@@ -161,10 +161,6 @@ fn write_with(file: &Path, extra: &[&str], input: &[u8]) -> Capture {
 
 fn write_stdin(file: &Path, size: &str, input: &[u8]) -> Capture {
     write_with(file, &["-s", size], input)
-}
-
-fn write_stdin_force(file: &Path, size: &str, input: &[u8]) -> Capture {
-    write_with(file, &["-s", size, "--force"], input)
 }
 
 /// 分批写入并等待每一批真正落盘（头部 seq 增加），用于确定性地制造多次 append。
@@ -363,7 +359,6 @@ const SLOT_BYTES: usize = 64;
 #[derive(Clone, Copy, Debug)]
 struct Slot {
     seq: u64,
-    epoch: u64,
     capacity: u64,
     write_pos: u64,
     total_written: u64,
@@ -404,13 +399,11 @@ fn parse_slot(buf: &[u8]) -> Option<Slot> {
     let write_pos = u64::from_le_bytes(buf[24..32].try_into().unwrap());
     let total_written = u64::from_le_bytes(buf[32..40].try_into().unwrap());
     let seq = u64::from_le_bytes(buf[40..48].try_into().unwrap());
-    let epoch = u64::from_le_bytes(buf[48..56].try_into().unwrap());
     if capacity == 0 || write_pos >= capacity || total_written % capacity != write_pos {
         return None;
     }
     Some(Slot {
         seq,
-        epoch,
         capacity,
         write_pos,
         total_written,
@@ -449,7 +442,7 @@ fn max_seq(file: &Path) -> Option<u64> {
         .max()
 }
 
-fn build_slot(seq: u64, epoch: u64, capacity: u64, write_pos: u64, total: u64) -> [u8; 64] {
+fn build_slot(seq: u64, capacity: u64, write_pos: u64, total: u64) -> [u8; 64] {
     let mut buf = [0u8; 64];
     buf[0..8].copy_from_slice(&u64::from_le_bytes(*b"RINGLOG1").to_le_bytes());
     buf[8..12].copy_from_slice(&1u32.to_le_bytes());
@@ -458,7 +451,6 @@ fn build_slot(seq: u64, epoch: u64, capacity: u64, write_pos: u64, total: u64) -
     buf[24..32].copy_from_slice(&write_pos.to_le_bytes());
     buf[32..40].copy_from_slice(&total.to_le_bytes());
     buf[40..48].copy_from_slice(&seq.to_le_bytes());
-    buf[48..56].copy_from_slice(&epoch.to_le_bytes());
     let crc = crc32c(&buf[..56]);
     buf[56..60].copy_from_slice(&crc.to_le_bytes());
     buf
@@ -826,7 +818,7 @@ fn corrupt_latest_slot_falls_back_to_previous() {
 }
 
 #[test]
-fn both_slots_corrupt_require_force() {
+fn both_slots_corrupt_are_rejected() {
     let dir = TestDir::new("adv");
     let file = dir.file("both.ring");
     assert_eq!(write_stdin(&file, "8K", b"seed\n").code(), Some(0));
@@ -846,22 +838,19 @@ fn both_slots_corrupt_require_force() {
         "读者报错应说明头部损坏，stderr={stderr}"
     );
 
-    // 未加 --force 的写者不能静默覆盖。
+    // 写者不会覆盖无法识别的文件：ringlog 没有重建开关。
     let out = write_stdin(&file, "8K", b"x\n");
     assert_eq!(out.code(), Some(2), "写者应报错退出 2");
     let stderr = out.err();
     assert_no_panic(&stderr);
     assert!(
-        stderr.contains("--force"),
-        "写者应提示 --force，stderr={stderr}"
+        stderr.contains("文件头无效")
+            && stderr.contains("不会覆盖")
+            && stderr.contains("删除该文件"),
+        "写者应说明文件头无效、不会覆盖并给出重建办法，stderr={stderr}"
     );
     assert_eq!(fs::read(&file).unwrap(), broken, "失败时不能改文件内容");
     assert_ne!(before, broken);
-
-    let out = write_stdin_force(&file, "8K", b"rebuilt\n");
-    assert_eq!(out.code(), Some(0), "--force 重建失败: {}", out.err());
-    assert_eq!(file_len(&file), 8192);
-    assert_eq!(dump(&file), b"rebuilt\n");
 }
 
 #[test]
@@ -878,7 +867,7 @@ fn inconsistent_header_invariant_is_rejected() {
 
     // 合法 CRC，但 total_written % capacity != write_pos。
     // 如果读者接受它，dump 会读出 "AAAA\n"（外加未初始化的尾巴）。
-    patch_slot(&file, 0, &build_slot(a.seq, a.epoch, a.capacity, 5, 10));
+    patch_slot(&file, 0, &build_slot(a.seq, a.capacity, 5, 10));
     let corrupted = read_slots(&file)[0];
     assert!(corrupted.is_none(), "测试前提：该 slot 因不变量失败而无效");
 
@@ -896,9 +885,9 @@ fn inconsistent_header_invariant_is_rejected() {
     patch_slot(
         &file,
         0,
-        &build_slot(a.seq, a.epoch, a.capacity, a.write_pos, a.total_written + 1),
+        &build_slot(a.seq, a.capacity, a.write_pos, a.total_written + 1),
     );
-    patch_slot(&file, 1, &build_slot(b.seq, b.epoch, b.capacity, 0, 1));
+    patch_slot(&file, 1, &build_slot(b.seq, b.capacity, 0, 1));
     assert!(read_slots(&file).iter().all(|slot| slot.is_none()));
 
     let out = run(&["-n", "1", path_text(&file)]);
@@ -910,7 +899,7 @@ fn inconsistent_header_invariant_is_rejected() {
     );
     let out = write_stdin(&file, "8K", b"x\n");
     assert_eq!(out.code(), Some(2));
-    assert!(out.err().contains("--force"));
+    assert!(out.err().contains("文件头无效"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,33 +1196,32 @@ fn follow_concurrent_8k_wrap_only_complete_lines() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. `--force` 重建与正在跟随的读者
+// 8. 文件被外部改写后的重置检测
 // ---------------------------------------------------------------------------
 
 #[test]
-fn follow_detects_force_reset_same_size() {
+fn follow_detects_total_written_regression() {
     let dir = TestDir::new("adv");
     let file = dir.file("reset.ring");
-    assert_eq!(
-        write_stdin(&file, "8K", b"old1\nold2\nold3\n").code(),
-        Some(0)
-    );
+    let old: String = (0..200).map(|i| format!("old {i}\n")).collect();
+    assert_eq!(write_stdin(&file, "8K", old.as_bytes()).code(), Some(0));
 
     let follower = Follower::spawn(&file, &["--interval-ms", "50"]);
     assert!(
-        follower.wait_out(b"old3\n", Duration::from_secs(3)),
+        follower.wait_out(b"old 199\n", Duration::from_secs(3)),
         "follower 没有先输出历史"
     );
 
-    let mut new_data = String::new();
-    for i in 0..100u32 {
-        new_data.push_str(&format!("NEW-LINE-{i:03}\n"));
-    }
-    // 新数据总长比旧数据大：单靠 total_written 回退无法发现重置，必须靠 epoch。
-    let out = write_stdin_force(&file, "8K", new_data.as_bytes());
-    assert_eq!(out.code(), Some(0), "--force 重建失败: {}", out.err());
+    // 外部把头部改写成“刚刚初始化”（累计写入回退到 0）。ringlog 自己不会再重建文件，
+    // 跟随端只能靠累计写入回退发现重置。
+    let slots = read_slots(&file);
+    let newest = slots.into_iter().flatten().max_by_key(|s| s.seq).unwrap();
+    patch_slot(&file, 0, &build_slot(newest.seq + 1, newest.capacity, 0, 0));
+
+    let out = write_stdin(&file, "8K", b"fresh\n");
+    assert_eq!(out.code(), Some(0), "续写失败: {}", out.err());
     assert!(
-        follower.wait_out(b"NEW-LINE-099\n", Duration::from_secs(3)),
+        follower.wait_out(b"fresh\n", Duration::from_secs(3)),
         "重置后没有读到新数据"
     );
     let (stdout, stderr, code) = follower.stop();
@@ -1245,13 +1233,14 @@ fn follow_detects_force_reset_same_size() {
         "应告警检测到重置，stderr={stderr}"
     );
     assert!(
-        stdout.ends_with(new_data.as_bytes()),
-        "重置后应输出完整的新数据"
+        stdout.ends_with(b"fresh\n"),
+        "重置后应继续输出重置后的数据，stdout 末尾: {:?}",
+        String::from_utf8_lossy(&stdout[stdout.len().saturating_sub(40)..])
     );
 }
 
 #[test]
-fn follow_handles_force_resize_as_documented() {
+fn follow_detects_capacity_change() {
     let dir = TestDir::new("adv");
     let file = dir.file("resize.ring");
     assert_eq!(write_stdin(&file, "8K", b"old\n").code(), Some(0));
@@ -1261,10 +1250,12 @@ fn follow_handles_force_resize_as_documented() {
         follower.wait_out(b"old\n", Duration::from_secs(3)),
         "follower 没有先输出历史"
     );
-    let out = write_stdin_force(&file, "16K", b"new-a\nnew-b\n");
-    assert_eq!(out.code(), Some(0), "--force 改大小失败: {}", out.err());
 
-    // README：改变文件大小时数据区几何变了，读者应报错退出并提示重启。
+    // 外部改写了头区容量（ringlog 不会这么做）：读者应报错退出，而不是按错的几何继续读。
+    let slots = read_slots(&file);
+    let newest = slots.into_iter().flatten().max_by_key(|s| s.seq).unwrap();
+    patch_slot(&file, 0, &build_slot(newest.seq + 1, 16 * 1024, 0, 0));
+
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut status = None;
     while Instant::now() < deadline {
@@ -1276,7 +1267,7 @@ fn follow_handles_force_resize_as_documented() {
     }
     let status = match status {
         Some(status) => status,
-        None => panic!("改变文件大小后 follower 应报错退出，而不是继续跑"),
+        None => panic!("头区容量变化后 follower 应报错退出，而不是继续跑"),
     };
     assert_eq!(status.code(), Some(2), "应按无效数据退出码 2");
     let (stdout, stderr, code) = follower.stop();
@@ -1347,10 +1338,14 @@ fn reader_rejects_uninitialized_and_truncated_files() {
     assert_eq!(out.code(), Some(2));
     assert!(out.err().contains("不是有效") || out.err().contains("文件头"));
 
-    // 写者不 --force 也不能把截断文件当正常文件续写。
+    // 写者不能把截断文件当正常文件续写。
     let out = write_stdin(&file, "8K", b"x\n");
     assert_eq!(out.code(), Some(2), "截断文件的容量与头区不一致，应拒绝");
-    assert!(out.err().contains("不一致"), "stderr={}", out.err());
+    assert!(
+        out.err().contains("不一致") && out.err().contains("删除该文件"),
+        "stderr={}",
+        out.err()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +1369,6 @@ fn usage_errors_exit_two() {
         vec!["-s", "8K", "-n", "1", p],
         vec!["-s", "8K", "--info", p],
         vec!["-n", "0", p],
-        vec!["--force", "-f", p],
         vec!["-n", "-5", p],
         vec!["-s", "8K", p, p],
     ];

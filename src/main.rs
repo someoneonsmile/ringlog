@@ -41,7 +41,7 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> io::Result<()> {
     match cli.mode {
-        Mode::Write { size, sync, force } => writer::run(&cli.path, size, force, sync),
+        Mode::Write { size, sync } => writer::run(&cli.path, size, sync),
         Mode::Read {
             follow: follow_mode,
             start,

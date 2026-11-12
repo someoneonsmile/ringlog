@@ -22,7 +22,7 @@
 //! 24..32  write_pos       下一次写入在数据区内的偏移
 //! 32..40  total_written   累计写入数据区（含环绕填充）的字节数
 //! 40..48  seq             每次更新 +1，决定 slot 新旧与奇偶
-//! 48..56  epoch           文件“重置纪元”：初始化/--force 重建时 +1，用于读者识别重置
+//! 48..56  reserved        保留，0（v1 早期版本曾用作 epoch，读取时忽略以兼容旧文件）
 //! 56..60  crc32c(buf[0..56])
 //! 60..64  reserved        置 0
 //! ```
@@ -61,17 +61,15 @@ const CRC_RANGE_END: usize = 56;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub seq: u64,
-    pub epoch: u64,
     pub capacity: u64,
     pub write_pos: u64,
     pub total_written: u64,
 }
 
 impl Header {
-    pub fn new(seq: u64, epoch: u64, capacity: u64) -> Self {
+    pub fn new(seq: u64, capacity: u64) -> Self {
         Self {
             seq,
-            epoch,
             capacity,
             write_pos: 0,
             total_written: 0,
@@ -87,7 +85,6 @@ impl Header {
         buf[24..32].copy_from_slice(&self.write_pos.to_le_bytes());
         buf[32..40].copy_from_slice(&self.total_written.to_le_bytes());
         buf[40..48].copy_from_slice(&self.seq.to_le_bytes());
-        buf[48..56].copy_from_slice(&self.epoch.to_le_bytes());
         let crc = crc32c(&buf[..CRC_RANGE_END]);
         buf[56..60].copy_from_slice(&crc.to_le_bytes());
         buf
@@ -115,13 +112,11 @@ impl Header {
         let write_pos = u64::from_le_bytes(buf[24..32].try_into().ok()?);
         let total_written = u64::from_le_bytes(buf[32..40].try_into().ok()?);
         let seq = u64::from_le_bytes(buf[40..48].try_into().ok()?);
-        let epoch = u64::from_le_bytes(buf[48..56].try_into().ok()?);
         if capacity == 0 || write_pos >= capacity || total_written % capacity != write_pos {
             return None;
         }
         Some(Self {
             seq,
-            epoch,
             capacity,
             write_pos,
             total_written,
@@ -144,7 +139,6 @@ mod tests {
     fn header_roundtrip() {
         let h = Header {
             seq: 42,
-            epoch: 7,
             capacity: 65536,
             write_pos: 1234,
             total_written: 65536 * 3 + 1234,
@@ -155,7 +149,7 @@ mod tests {
 
     #[test]
     fn header_rejects_torn_slot() {
-        let h = Header::new(7, 1, 4096);
+        let h = Header::new(7, 4096);
         let mut slot = h.to_slot();
         slot[24] ^= 0xff;
         assert_eq!(Header::from_slot(&slot), None);
@@ -163,7 +157,7 @@ mod tests {
 
     #[test]
     fn header_rejects_inconsistent_positions() {
-        let mut h = Header::new(7, 1, 4096);
+        let mut h = Header::new(7, 4096);
         h.write_pos = 100;
         // total_written 不满足不变量
         assert_eq!(h.to_slot().len(), SLOT_BYTES);

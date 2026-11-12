@@ -36,7 +36,6 @@ pub fn run(path: &Path) -> io::Result<()> {
         format_size(used, BINARY)
     );
     let _ = writeln!(text, "头部序号:   {}", header.seq);
-    let _ = writeln!(text, "重置纪元:   {}", header.epoch);
     report::stdout(&text);
     Ok(())
 }

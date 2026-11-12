@@ -23,8 +23,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 /// `--sync` 时每批都要 fsync，兜底间隔放宽，避免低速率输入下频繁刷盘。
 const SYNC_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
-pub fn run(path: &Path, size: u64, force: bool, sync: bool) -> io::Result<()> {
-    let mut ring = Ring::open(path, size, force, sync)?;
+pub fn run(path: &Path, size: u64, sync: bool) -> io::Result<()> {
+    let mut ring = Ring::open(path, size, sync)?;
 
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(4);
     let reader_thread = thread::spawn(move || -> io::Result<()> {
@@ -122,10 +122,10 @@ fn account_truncation(splitter: &mut LineSplitter, total: &mut u64, warned: &mut
 fn flush_batch(
     ring: &mut Ring,
     splitter: &mut LineSplitter,
-    force: bool,
+    flush_now: bool,
     final_chunk: bool,
 ) -> io::Result<()> {
-    if !force && splitter.payload_len() < FLUSH_BYTES {
+    if !flush_now && splitter.payload_len() < FLUSH_BYTES {
         return Ok(());
     }
     ring.append(splitter.take(final_chunk))

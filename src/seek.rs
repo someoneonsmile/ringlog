@@ -149,7 +149,7 @@ mod tests {
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path =
                 std::env::temp_dir().join(format!("ringlog-seek-{}-{id}.ring", std::process::id()));
-            let mut ring = Ring::open(&path, file_size(capacity), true, false).unwrap();
+            let mut ring = Ring::open(&path, file_size(capacity), false).unwrap();
             let mut splitter = LineSplitter::new(capacity);
             splitter.feed(data);
             ring.append(splitter.take(true)).unwrap();

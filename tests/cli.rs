@@ -367,25 +367,29 @@ fn size_over_max_rejected() {
 }
 
 #[test]
-fn size_mismatch_needs_force() {
+fn size_mismatch_is_rejected() {
     let dir = TestDir::new("it");
     let file = dir.file("mismatch.ring");
     assert!(write_stdin(&file, "16K", b"old\n").status.success());
 
+    // 大小不一致是用法错误：ringlog 不会改大小，也没有重建开关。
     let out = write_stdin(&file, "32K", b"new\n");
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("不一致"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("不一致")
+            && String::from_utf8_lossy(&out.stderr).contains("删除该文件"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&file).unwrap().len(),
+        16 * 1024,
+        "失败时不能改变文件大小"
+    );
 
-    let out = write_stdin(&file, "32K", b"new\n");
-    assert_eq!(out.status.code(), Some(2));
-
-    let mut force = bin();
-    force.args(["-s", "32K", "--force"]).arg(&file);
-    force.stdin(Stdio::piped()).stdout(Stdio::piped());
-    let mut child = force.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"rebuilt\n").unwrap();
-    assert!(child.wait().unwrap().success());
-    assert_eq!(dump_text(&file), "rebuilt\n");
+    // 原文件仍按原大小续写。
+    assert!(write_stdin(&file, "16K", b"more\n").status.success());
+    assert_eq!(dump_text(&file), "old\nmore\n");
 }
 
 #[test]
@@ -599,31 +603,6 @@ fn concurrent_reader_never_outputs_torn_lines() {
 }
 
 #[test]
-fn force_reset_is_noticed_by_follower() {
-    let dir = TestDir::new("it");
-    let file = dir.file("reset.ring");
-    assert!(write_stdin(&file, "8K", b"a\nb\nc\n").status.success());
-
-    let follower = Follower::spawn(&file, &["-n", "0", "--interval-ms", "20"]);
-    thread::sleep(Duration::from_millis(200));
-
-    let mut child = bin()
-        .args(["-s", "8K", "--force"])
-        .arg(&file)
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(b"fresh\n").unwrap();
-    assert!(child.wait().unwrap().success());
-    thread::sleep(Duration::from_millis(400));
-
-    let (stdout, stderr) = follower.stop();
-    assert_eq!(stdout, "fresh\n");
-    assert!(stderr.contains("重新初始化"), "stderr: {stderr}");
-}
-
-#[test]
 fn newest_header_slot_corruption_falls_back() {
     let dir = TestDir::new("it");
     let file = dir.file("slot.ring");
@@ -668,43 +647,6 @@ fn closed_stderr_does_not_crash_writer() {
         .unwrap();
     assert!(child.wait().unwrap().success());
     assert_eq!(dump(&file).len(), 4096);
-}
-
-#[test]
-fn force_reset_with_larger_total_is_detected() {
-    let dir = TestDir::new("it");
-    let file = dir.file("reset2.ring");
-    assert!(write_stdin(&file, "8K", b"old\n").status.success());
-
-    let follower = Follower::spawn(&file, &["-n", "0", "--interval-ms", "20"]);
-    thread::sleep(Duration::from_millis(200));
-
-    // 重建后新数据总量远大于读者已读位置，只有 epoch 能识别出重置
-    let fresh: String = (0..300).map(|i| format!("new {i}\n")).collect();
-    let mut child = bin()
-        .args(["-s", "8K", "--force"])
-        .arg(&file)
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(fresh.as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
-    thread::sleep(Duration::from_millis(400));
-
-    let (stdout, stderr) = follower.stop();
-    assert!(stderr.contains("重新初始化"), "stderr: {stderr}");
-    assert!(
-        stdout.ends_with("new 299\n"),
-        "stdout 末尾: {:?}",
-        &stdout[stdout.len().saturating_sub(40)..]
-    );
-    assert!(!stdout.is_empty());
 }
 
 #[test]
