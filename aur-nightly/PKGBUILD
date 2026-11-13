@@ -8,6 +8,7 @@ pkgdesc="Fixed-size single-file ring log — nightly build"
 arch=('x86_64' 'aarch64')
 url="https://github.com/someoneonsmile/ringlog"
 license=('MIT')
+options=('!strip' '!debug')
 
 _source_base="${url}/releases/download/nightly"
 
