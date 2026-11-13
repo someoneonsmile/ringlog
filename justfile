@@ -1,6 +1,10 @@
 # ringlog — 固定大小的单文件环形日志
 # https://github.com/cargo/just
 
+BINARY := "ringlog"
+AUR_PKG := "ringlog-bin"
+AUR_NIGHTLY_PKG := "ringlog-nightly-bin"
+
 _default:
     @just --list
 
@@ -68,19 +72,19 @@ SHELL_HELP_DIR := "shell_help"
 # 安装到系统（/usr/local/bin/ringlog + bash/zsh/fish 补全 + man）
 install:
     SHELL_HELP_DIR={{ SHELL_HELP_DIR }} cargo build --release
-    sudo install -Dm755 target/release/ringlog "{{ DESTDIR }}{{ BINDIR }}/ringlog"
-    sudo install -Dm644 {{ SHELL_HELP_DIR }}/complete/ringlog.bash "{{ DESTDIR }}{{ DATADIR }}/bash-completion/completions/ringlog"
-    sudo install -Dm644 {{ SHELL_HELP_DIR }}/complete/_ringlog "{{ DESTDIR }}{{ DATADIR }}/zsh/site-functions/_ringlog"
-    sudo install -Dm644 {{ SHELL_HELP_DIR }}/complete/ringlog.fish "{{ DESTDIR }}{{ DATADIR }}/fish/vendor_completions.d/ringlog.fish"
-    sudo install -Dm644 {{ SHELL_HELP_DIR }}/man/ringlog.1 "{{ DESTDIR }}{{ MANDIR }}/man1/ringlog.1"
+    sudo install -Dm755 target/release/{{ BINARY }} "{{ DESTDIR }}{{ BINDIR }}/{{ BINARY }}"
+    sudo install -Dm644 {{ SHELL_HELP_DIR }}/complete/{{ BINARY }}.bash "{{ DESTDIR }}{{ DATADIR }}/bash-completion/completions/{{ BINARY }}"
+    sudo install -Dm644 {{ SHELL_HELP_DIR }}/complete/_{{ BINARY }} "{{ DESTDIR }}{{ DATADIR }}/zsh/site-functions/_{{ BINARY }}"
+    sudo install -Dm644 {{ SHELL_HELP_DIR }}/complete/{{ BINARY }}.fish "{{ DESTDIR }}{{ DATADIR }}/fish/vendor_completions.d/{{ BINARY }}.fish"
+    sudo install -Dm644 {{ SHELL_HELP_DIR }}/man/{{ BINARY }}.1 "{{ DESTDIR }}{{ MANDIR }}/man1/{{ BINARY }}.1"
 
 # 从系统中卸载 ringlog 及其补全和 man
 uninstall:
-    sudo rm -f "{{ DESTDIR }}{{ BINDIR }}/ringlog"
-    sudo rm -f "{{ DESTDIR }}{{ DATADIR }}/bash-completion/completions/ringlog"
-    sudo rm -f "{{ DESTDIR }}{{ DATADIR }}/zsh/site-functions/_ringlog"
-    sudo rm -f "{{ DESTDIR }}{{ DATADIR }}/fish/vendor_completions.d/ringlog.fish"
-    sudo rm -f "{{ DESTDIR }}{{ MANDIR }}/man1/ringlog.1"
+    sudo rm -f "{{ DESTDIR }}{{ BINDIR }}/{{ BINARY }}"
+    sudo rm -f "{{ DESTDIR }}{{ DATADIR }}/bash-completion/completions/{{ BINARY }}"
+    sudo rm -f "{{ DESTDIR }}{{ DATADIR }}/zsh/site-functions/_{{ BINARY }}"
+    sudo rm -f "{{ DESTDIR }}{{ DATADIR }}/fish/vendor_completions.d/{{ BINARY }}.fish"
+    sudo rm -f "{{ DESTDIR }}{{ MANDIR }}/man1/{{ BINARY }}.1"
 
 # 监听文件变更，自动 check
 watch:
@@ -108,7 +112,7 @@ aur-push:
     git commit -m "chore: update AUR package" || true
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
-    git clone ssh://aur@aur.archlinux.org/ringlog-bin.git "$TMP"
+    git clone ssh://aur@aur.archlinux.org/{{ AUR_PKG }}.git "$TMP"
     cp aur/PKGBUILD aur/.SRCINFO "$TMP/"
     git -C "$TMP" add -A
     git -C "$TMP" commit -m "chore: update AUR package" || true
@@ -125,7 +129,7 @@ aur-release VERSION:
     git commit -m "chore: update AUR to v{{VERSION}}" || true
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
-    git clone ssh://aur@aur.archlinux.org/ringlog-bin.git "$TMP"
+    git clone ssh://aur@aur.archlinux.org/{{ AUR_PKG }}.git "$TMP"
     cp aur/PKGBUILD aur/.SRCINFO "$TMP/"
     git -C "$TMP" add -A
     git -C "$TMP" commit -m "chore: update AUR to v{{VERSION}}" || true
@@ -146,7 +150,7 @@ aur-nightly-push:
     git commit -m "chore: update nightly AUR package" || true
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
-    git clone ssh://aur@aur.archlinux.org/ringlog-nightly-bin.git "$TMP"
+    git clone ssh://aur@aur.archlinux.org/{{ AUR_NIGHTLY_PKG }}.git "$TMP"
     cp aur-nightly/PKGBUILD aur-nightly/.SRCINFO "$TMP/"
     git -C "$TMP" add -A
     git -C "$TMP" commit -m "chore: update nightly AUR package" || true
@@ -174,7 +178,7 @@ aur-nightly-release:
     git commit -m "chore: update nightly AUR to ${PKGVER}" || true
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
-    git clone ssh://aur@aur.archlinux.org/ringlog-nightly-bin.git "$TMP"
+    git clone ssh://aur@aur.archlinux.org/{{ AUR_NIGHTLY_PKG }}.git "$TMP"
     cp aur-nightly/PKGBUILD aur-nightly/.SRCINFO "$TMP/"
     git -C "$TMP" add -A
     git -C "$TMP" commit -m "chore: update nightly AUR to ${PKGVER}" || true
