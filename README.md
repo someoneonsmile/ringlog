@@ -170,22 +170,27 @@ slot 布局（小端）：
 
 ## 代码结构
 
-`ringlog` 库只做引擎，命令行应用在 bin 层：
+单个 bin crate，不导出库 target；引擎作为自包含模块挂在 `main.rs` 下：
 
-- `src/format.rs` / `src/ring.rs` / `src/input.rs` / `src/seek.rs` / `src/error.rs`：
-  文件格式、环形读写、行分帧、窗口定位、错误分类，**不接触终端**；
-- `src/main.rs` + `src/app/`：参数解析（`cli`）、写入泵（`writer`）、跟随输出（`follow`）、
+- `src/engine/`：自包含的引擎模块，**不接触终端**。子模块全部私有——`format`
+  文件布局与头部编解码、`ring` 环形读写与锁文件、`input` 行分帧、`seek` 窗口定位、
+  `error` 错误分类；命令行层只通过 `engine/mod.rs` 的 `pub(crate) use` 访问引擎；
+- `src/main.rs`：入口，声明 `mod engine;` 与 `mod app;`；
+- `src/app/`：参数解析（`cli`）、写入泵（`writer`）、跟随输出（`follow`）、
   元信息（`info`）；stdout / stderr 只经过 `app/report`。
 
 ```
 src/
-├── lib.rs format.rs ring.rs input.rs seek.rs error.rs   # 引擎（无终端 I/O）
-├── main.rs                                             # 入口：parse → 分派 → 退出码
+├── main.rs                 # 入口：mod engine; mod app; → parse → 分派 → 退出码
+├── engine/                 # 自包含引擎：私有子模块 + mod.rs 门面
+│   └── mod.rs format.rs ring.rs input.rs seek.rs error.rs
 └── app/  cli.rs writer.rs follow.rs info.rs report.rs   # 应用层
 ```
 
-分层规则、模块职责与跨模块契约见 [docs/architecture.md](docs/architecture.md)；
-这次重构的问题清单与决策见 [docs/architecture-review.md](docs/architecture-review.md)。
+引擎内部的项用 `pub(super)`，不出 `engine` 模块；`Header` / `Located` 随函数签名
+使用、`lock_path` 由 `Ring::open` 内部调用，都不在门面清单里。集成测试是纯黑盒：
+通过 `CARGO_BIN_EXE_ringlog` 起进程验证 CLI 契约，不依赖内部 API（锁路径规则在
+`tests/common` 里独立实现一份）。
 
 ## 构建与测试
 

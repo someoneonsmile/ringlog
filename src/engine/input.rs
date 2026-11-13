@@ -120,7 +120,9 @@ impl LineSplitter {
         self.payload.len()
     }
 
-    pub fn truncated_lines(&self) -> u64 {
+    /// 仅供测试断言截断计数；生产代码只用 [`Self::take_truncated_lines`]。
+    #[cfg(test)]
+    pub(super) fn truncated_lines(&self) -> u64 {
         self.truncated_lines
     }
 

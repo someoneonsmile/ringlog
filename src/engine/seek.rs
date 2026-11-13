@@ -9,8 +9,8 @@
 
 use std::io;
 
-use crate::format::Header;
-use crate::ring::Reader;
+use super::format::Header;
+use super::ring::Reader;
 
 /// 每次扫描最多搬运的字节数。
 const CHUNK: usize = 64 * 1024;
@@ -133,9 +133,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::format::file_size;
-    use crate::input::LineSplitter;
-    use crate::ring::Ring;
+    use super::super::format::file_size;
+    use super::super::input::LineSplitter;
+    use super::super::ring::Ring;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -161,7 +161,7 @@ mod tests {
 
     impl Drop for TempRing {
         fn drop(&mut self) {
-            if let Ok(lock) = crate::ring::lock_path(&self.path) {
+            if let Ok(lock) = super::super::ring::lock_path(&self.path) {
                 let _ = std::fs::remove_file(lock);
             }
             let _ = std::fs::remove_file(&self.path);

@@ -47,6 +47,22 @@ pub fn path_text(path: &Path) -> &str {
 
 /// 侧车锁文件路径：按目标文件的规范路径派生（与写者实现一致），
 /// 否则通过符号链接或带 `..`/`.` 的路径找不到写者实际持有的那把锁。
+///
+/// 测试侧独立实现一份，而不是调用被测程序内部函数：路径推导规则本身也是
+/// 被测契约的一部分，且集成测试不依赖二进制 crate 的内部可见性。
 pub fn lock_path(file: &Path) -> PathBuf {
-    ringlog::ring::lock_path(file).unwrap()
+    let target = match file.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            let name = file.file_name().expect("测试路径必须带文件名");
+            let parent = match file.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            parent.canonicalize().unwrap().join(name)
+        }
+    };
+    let mut name = target.into_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
 }

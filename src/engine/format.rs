@@ -43,32 +43,32 @@ use std::fmt;
 
 use crc32c::crc32c;
 
-pub const HEADER_PAGE: u64 = 4096;
-pub const DATA_OFFSET: u64 = HEADER_PAGE;
-pub const SLOT_SIZE: u64 = 64;
-pub const SLOT_BYTES: usize = SLOT_SIZE as usize;
-pub const SLOT_OFFSETS: [u64; 2] = [0, SLOT_SIZE];
+pub(super) const HEADER_PAGE: u64 = 4096;
+pub(super) const DATA_OFFSET: u64 = HEADER_PAGE;
+pub(super) const SLOT_SIZE: u64 = 64;
+pub(super) const SLOT_BYTES: usize = SLOT_SIZE as usize;
+pub(super) const SLOT_OFFSETS: [u64; 2] = [0, SLOT_SIZE];
 /// 数据区最小容量（连同 4 KiB 头区，文件至少 8 KiB）。
-pub const MIN_DATA_CAPACITY: u64 = 4096;
+pub(super) const MIN_DATA_CAPACITY: u64 = 4096;
 /// 最小文件总大小。参数校验与打开文件都以它为准，避免几处各算一遍。
 pub const MIN_TOTAL_SIZE: u64 = HEADER_PAGE + MIN_DATA_CAPACITY;
 
 /// 文件魔数：标识「这是 ringlog 文件」，不含版本含义。
 const MAGIC: [u8; 8] = *b"RINGLOG\0";
 /// 本程序能读写的文件格式版本。
-pub const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 1;
 /// crc 字段的偏移，同时也是 crc 覆盖范围的终点。
 const CRC_OFFSET: usize = 60;
 
 /// 由文件总大小推导数据区容量；不满足最小几何要求时返回 `None`。
-pub fn data_capacity(total_size: u64) -> Option<u64> {
+pub(super) fn data_capacity(total_size: u64) -> Option<u64> {
     total_size
         .checked_sub(HEADER_PAGE)
         .filter(|capacity| *capacity >= MIN_DATA_CAPACITY)
 }
 
 /// 由数据区容量推导文件总大小。
-pub fn file_size(capacity: u64) -> u64 {
+pub(super) fn file_size(capacity: u64) -> u64 {
     HEADER_PAGE + capacity
 }
 
@@ -77,7 +77,7 @@ pub fn file_size(capacity: u64) -> u64 {
 /// 把「不是 ringlog」「版本不支持」「内容损坏」分开，上层才能给出可操作的提示，
 /// 而不是一律报「文件已损坏」让用户去删文件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderError {
+pub(super) enum HeaderError {
     /// magic 不匹配：这个文件根本不是 ringlog 文件。
     NotRinglog,
     /// magic 匹配，但格式版本不受本程序支持（典型场景：旧程序读到新版程序写的文件）。
@@ -107,7 +107,7 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn new(seq: u64, capacity: u64) -> Self {
+    pub(super) fn new(seq: u64, capacity: u64) -> Self {
         Self {
             seq,
             capacity,
@@ -116,7 +116,7 @@ impl Header {
         }
     }
 
-    pub fn to_slot(self) -> [u8; SLOT_BYTES] {
+    pub(super) fn to_slot(self) -> [u8; SLOT_BYTES] {
         let mut buf = [0u8; SLOT_BYTES];
         buf[0..8].copy_from_slice(&MAGIC);
         buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
@@ -134,7 +134,7 @@ impl Header {
     ///
     /// 校验顺序固定为 magic → version → slot_size → CRC → 位置不变量：版本判断不能依赖
     /// 本版本定义的 CRC 范围，否则旧程序读到新格式时会先撞上 CRC 错误、掩盖真正的原因。
-    pub fn from_slot(buf: &[u8; SLOT_BYTES]) -> Result<Self, HeaderError> {
+    pub(super) fn from_slot(buf: &[u8; SLOT_BYTES]) -> Result<Self, HeaderError> {
         if buf[..8] != MAGIC[..] {
             return Err(HeaderError::NotRinglog);
         }

@@ -13,8 +13,8 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use crate::error::{invalid, usage};
-use crate::format::{
+use super::error::{invalid, usage};
+use super::format::{
     DATA_OFFSET, HEADER_PAGE, Header, HeaderError, MIN_DATA_CAPACITY, MIN_TOTAL_SIZE, SLOT_BYTES,
     SLOT_OFFSETS, data_capacity, file_size,
 };
@@ -29,7 +29,7 @@ static PAD_BYTES: [u8; PAD_CHUNK] = [b'\n'; PAD_CHUNK];
 /// 锁按「文件」而不是「路径字符串」取：相对路径、`..`、符号链接都归一到同一把锁，
 /// 否则同一个文件的两种写法会各自建一个锁文件，单写者保证被绕过。目标文件尚不存在
 /// （首次创建）时退化为「规范化父目录 + 文件名」。
-pub fn lock_path(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn lock_path(path: &Path) -> io::Result<PathBuf> {
     let mut name = canonical_target(path)?.into_os_string();
     name.push(".lock");
     Ok(PathBuf::from(name))

@@ -13,8 +13,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use ringlog::ring::Reader;
-use ringlog::seek::{StartPos, locate_start, scan_to_next_line};
+use crate::engine::{Reader, StartPos, locate_start, scan_to_next_line};
 
 use super::report;
 

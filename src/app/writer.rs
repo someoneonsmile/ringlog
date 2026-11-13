@@ -9,8 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ringlog::input::LineSplitter;
-use ringlog::ring::Ring;
+use crate::engine::{LineSplitter, Ring};
 
 use super::report;
 

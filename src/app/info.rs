@@ -4,8 +4,8 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
+use crate::engine::Reader;
 use humansize::{BINARY, format_size};
-use ringlog::ring::Reader;
 
 use super::report;
 

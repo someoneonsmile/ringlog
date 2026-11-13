@@ -11,8 +11,7 @@ use std::time::Duration;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 
-use ringlog::format::MIN_TOTAL_SIZE;
-use ringlog::seek::StartPos;
+use crate::engine::{MIN_TOTAL_SIZE, StartPos};
 
 use super::cli_types::{Args, MAX_TOTAL_SIZE};
 

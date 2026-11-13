@@ -3,12 +3,13 @@
 #![deny(unsafe_code)]
 
 mod app;
+mod engine;
 
 use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-use ringlog::ring::Reader;
+use crate::engine::Reader;
 
 use app::cli::{self, Cli, Mode};
 use app::{follow, info, report, writer};
@@ -30,7 +31,7 @@ fn main() -> ExitCode {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             report::warn(format_args!("{e}"));
-            if ringlog::error::is_user_error(e.kind()) {
+            if crate::engine::is_user_error(e.kind()) {
                 ExitCode::from(2)
             } else {
                 ExitCode::from(1)

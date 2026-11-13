@@ -10,12 +10,12 @@
 use std::io;
 
 /// 构造「用法错误」。
-pub(crate) fn usage(message: impl Into<String>) -> io::Error {
+pub(super) fn usage(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 /// 构造「数据错误」。
-pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
+pub(super) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
